@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.15] - 2026-10-15
+
+### Fixed
+
+- Stop key repeat before releasing held input when control leaves an endpoint. Retain failed key, mouse-button and native macOS modifier releases for retry instead of discarding their handle.
+- Pause new input and entry warps while a previous handle still has unconfirmed cleanup; retry in the serial emulation worker without restarting the backend. Share macOS exit and termination cleanup.
+
+## [0.17.14] - 2026-10-15
+
+### Fixed
+
+- Synchronize macOS lock state before enabling a newly registered capture edge, so an unlock missed while disconnected cannot permanently block returning to the controlling machine.
+- Retain lock protection when reconnecting to a locked Mac, and queue the initial state before the edge's first capture event.
+- Recheck disabled macOS event taps after unlock, notify capture of Windows session lock changes, and retry emulation after local unlock or transient Windows input failures.
+
 ## [0.17.13](https://github.com/alvin-7/mousehop/compare/v0.17.12...v0.17.13) - 2026-09-28
 
 ### Fixed

@@ -1785,7 +1785,13 @@ impl EmulationTask {
 
     async fn run(mut self) {
         loop {
+            let mut retry_windows_input = false;
             if let Err(e) = self.do_emulation().await {
+                retry_windows_input = cfg!(windows)
+                    && matches!(
+                        &e,
+                        InputEmulationError::Emulate(input_emulation::EmulationError::Io(_))
+                    );
                 log::warn!("input emulation exited: {e}");
             }
             for token in self.recovery_tokens.borrow().values() {
@@ -1798,6 +1804,11 @@ impl EmulationTask {
             }
             if self.exit_requested.get() {
                 break;
+            }
+            if retry_windows_input {
+                // Secure desktop can reject SendInput until the session unlocks.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
             }
             // wait for reenable request
             loop {
@@ -1920,7 +1931,9 @@ impl EmulationTask {
                     // Forget/Remove may have completed concurrently with
                     // create(). Do not leave an untracked backend handle.
                     if self.handles.get(&addr) != Some(&handle) {
-                        emulation.destroy(handle).await;
+                        if let Err(error) = emulation.destroy(handle).await {
+                            log::warn!("retired input cleanup pending: {error}");
+                        }
                     } else if let Some(&pp) = self.post_processing.get(&addr) {
                         emulation.set_post_processing(handle, pp);
                     }
@@ -1947,10 +1960,30 @@ impl EmulationTask {
         // clamping — left stale, it pins the cursor to the old
         // display size until mousehop is quit.
         let mut bounds_poll = tokio::time::interval(Duration::from_secs(2));
+        let mut cleanup_blocked = false;
         loop {
+            let cleanup_ready = match emulation.retry_cleanup().await {
+                Ok(()) => {
+                    cleanup_blocked = false;
+                    true
+                }
+                Err(error) => {
+                    if !cleanup_blocked {
+                        log::warn!("new input paused until previous input is released: {error}");
+                    }
+                    cleanup_blocked = true;
+                    false
+                }
+            };
             tokio::select! {
                 biased;
                 Some(request) = self.recovery_rx.recv() => {
+                    // Cleanup may have become possible while select! waited
+                    // (for example after unlock). Retry before rejecting input.
+                    if !cleanup_ready && emulation.retry_cleanup().await.is_err() {
+                        let _ = request.done.send(Err(input_emulation::EmulationError::EndOfStream));
+                        continue;
+                    }
                     if !request.token.frozen() {
                         let _ = request.done.send(Err(input_emulation::EmulationError::EndOfStream));
                         continue;
@@ -1991,6 +2024,11 @@ impl EmulationTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Barrier(done) => { let _ = done.send(()); }
                     ProxyRequest::EpochInput(event, token, done, receipt) => {
+                        if !cleanup_ready && emulation.retry_cleanup().await.is_err() {
+                            if let Some(receipt) = receipt { receipt.expire(); }
+                            let _ = done.send(Err(input_emulation::EmulationError::EndOfStream));
+                            continue;
+                        }
                         if !token.valid() || receipt.as_ref().is_some_and(|r| !r.valid()) {
                             if let Some(receipt) = receipt { receipt.expire(); }
                             let _ = done.send(Err(input_emulation::EmulationError::EndOfStream));
@@ -2016,6 +2054,10 @@ impl EmulationTask {
                         let _ = done.send(result);
                     }
                     ProxyRequest::Input(event, addr, receipt) => {
+                        if !cleanup_ready && emulation.retry_cleanup().await.is_err() {
+                            if let Some(receipt) = receipt { receipt.abort(); }
+                            continue;
+                        }
                         // A managed address cannot bypass its epoch gate via
                         // legacy requests queued before recovery began.
                         if self.recovery_tokens.borrow().contains_key(&addr) && !matches!(event, Event::Clipboard(_)) { continue; }
@@ -2045,7 +2087,9 @@ impl EmulationTask {
                     ProxyRequest::Remove(addr) => {
                         if self.recovery_tokens.borrow().get(&addr).is_some_and(|t| !t.retired()) { continue; }
                         if let Some(handle) = self.handles.remove(&addr) {
-                            emulation.destroy(handle).await;
+                            if let Err(error) = emulation.destroy(handle).await {
+                                log::warn!("input cleanup pending for {addr}: {error}");
+                            }
                         }
                         // Intentionally keep `post_processing[addr]`
                         // alive across handle removal. `Remove` fires
@@ -2069,10 +2113,16 @@ impl EmulationTask {
                             &mut self.post_processing,
                             addr,
                         ) {
-                            emulation.destroy(handle).await;
+                            if let Err(error) = emulation.destroy(handle).await {
+                                log::warn!("disconnected input cleanup pending for {addr}: {error}");
+                            }
                         }
                     }
                     ProxyRequest::WarpToEdge(addr, edge, cross_fraction, completion, receipt) => {
+                        if !cleanup_ready && emulation.retry_cleanup().await.is_err() {
+                            let _ = completion.send(None);
+                            continue;
+                        }
                         if self.recovery_tokens.borrow().get(&addr).is_some_and(|t| !t.retired()) {
                             let _ = completion.send(None);
                             continue;

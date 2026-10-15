@@ -38,6 +38,7 @@ use input_event::{
 };
 
 use super::{CaptureEvent, Position, display_util};
+use crate::HostInputState;
 
 pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
@@ -549,6 +550,7 @@ unsafe extern "system" fn window_proc(
                 HOST_LOCKED.set(true);
                 HOST_MODIFIERS.with_borrow_mut(HashSet::clear);
                 HOST_VISIBLE_MODIFIERS.with_borrow_mut(HashSet::clear);
+                publish_host_input_state(HostInputState::Locked);
                 if let Some(pos) = ACTIVE_CLIENT.take() {
                     log::info!("host session locked mid-capture; releasing");
                     let _ = try_send_event(pos, CaptureEvent::AutoRelease);
@@ -559,11 +561,22 @@ unsafe extern "system" fn window_proc(
             WTS_SESSION_UNLOCK => {
                 HOST_LOCKED.set(false);
                 log::info!("host session unlocked");
+                publish_host_input_state(HostInputState::Unlocked);
             }
             _ => {}
         }
     }
     LRESULT(1)
+}
+
+fn publish_host_input_state(state: HostInputState) {
+    CLIENTS.with_borrow(|clients| {
+        for &pos in clients {
+            if let Err(error) = try_send_event(pos, CaptureEvent::HostInputState(state)) {
+                log::warn!("failed to publish host input {state:?} at {pos}: {error}");
+            }
+        }
+    });
 }
 
 fn update_host_modifier_state(event: &KeyboardEvent) {

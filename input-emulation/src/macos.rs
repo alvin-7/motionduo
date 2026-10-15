@@ -45,8 +45,8 @@ enum RepeatStopReason {
     Replaced,
     /// The repeating key was released.
     Released,
-    /// The client's session is being destroyed.
-    Destroyed,
+    /// Control is leaving this endpoint.
+    ControlLeft,
     /// A same-connection recovery is freezing remote input.
     Recovery,
     /// The backend itself is terminating.
@@ -58,15 +58,14 @@ impl RepeatStopReason {
         match self {
             Self::Replaced => "replaced",
             Self::Released => "released",
-            Self::Destroyed => "destroyed",
+            Self::ControlLeft => "control_left",
             Self::Recovery => "recovery",
             Self::Terminated => "terminated",
         }
     }
 }
 
-/// One `cleanup_begin` line shared by destroy/terminate. `handle` is the
-/// client handle destroy carries; terminate has none.
+/// One `cleanup_begin` line shared by control exit and termination.
 fn log_cleanup_begin(
     session: u64,
     handle: Option<EmulationHandle>,
@@ -432,15 +431,42 @@ impl MacOSEmulation {
         for button in pressed {
             if !self.post_button_event(button, 0, self.button_click_state) {
                 log::warn!("unable to synthesize release for stuck mouse button {button}");
+            } else {
+                self.pressed_buttons.remove(&button);
             }
         }
 
-        // Even if secure input prevented posting an up, never carry a stale
-        // drag into a later authenticated peer session.
-        self.pressed_buttons.clear();
-        self.previous_button = None;
-        self.previous_button_click = None;
-        self.button_click_state = 0;
+        if self.pressed_buttons.is_empty() {
+            self.previous_button = None;
+            self.previous_button_click = None;
+            self.button_click_state = 0;
+        }
+    }
+
+    fn cleanup_input(
+        &mut self,
+        handle: Option<EmulationHandle>,
+        source: &str,
+    ) -> Result<(), EmulationError> {
+        let session = self.key_injector.session();
+        log_cleanup_begin(
+            session,
+            handle,
+            source,
+            self.key_injector.pending(),
+            self.key_injector.current_path(),
+        );
+        self.release_tracked_buttons();
+        let residue = self.key_injector.release_all();
+        log_cleanup_end(session, handle, source, residue);
+        if !residue.is_empty() || !self.pressed_buttons.is_empty() {
+            return Err(EmulationError::Io(std::io::Error::other(
+                "macOS input release incomplete; retained for retry",
+            )));
+        }
+        self.physical_modifiers.set(PhysicalModifiers::empty());
+        self.modifier_state.set(XMods::empty());
+        Ok(())
     }
 
     /// Starts the repeat stream for `key`, releasing the key it replaces.
@@ -1096,53 +1122,28 @@ impl Emulation for MacOSEmulation {
         );
     }
 
-    async fn destroy(&mut self, handle: EmulationHandle) {
-        let session = self.key_injector.session();
-        log_cleanup_begin(
-            session,
-            Some(handle),
-            "destroy",
-            self.key_injector.pending(),
-            self.key_injector.current_path(),
-        );
-        // Lifecycle cleanup cannot propagate an error to a caller; the
-        // injector has already logged the failure and `release_all` below
-        // retries the release through both paths.
-        if let Err(status) = self.cancel_repeat_task(RepeatStopReason::Destroyed).await {
-            log::warn!(
-                target: KEYBOARD_LOG_TARGET,
-                "event=cleanup_repeat_release_failed session={session} source=destroy \
-                 status={status}"
-            );
-        }
-        self.release_tracked_buttons();
-        let residue = self.key_injector.release_all();
-        self.physical_modifiers.set(PhysicalModifiers::empty());
-        self.modifier_state.set(XMods::empty());
-        log_cleanup_end(session, Some(handle), "destroy", residue);
-    }
+    // InputEmulation has already completed checked cleanup before this call.
+    async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {
-        let session = self.key_injector.session();
-        log_cleanup_begin(
-            session,
-            None,
-            "terminate",
-            self.key_injector.pending(),
-            self.key_injector.current_path(),
-        );
         if let Err(status) = self.cancel_repeat_task(RepeatStopReason::Terminated).await {
             log::warn!(
                 target: KEYBOARD_LOG_TARGET,
-                "event=cleanup_repeat_release_failed session={session} source=terminate \
+                "event=cleanup_repeat_release_failed source=terminate \
                  status={status}"
             );
         }
-        self.release_tracked_buttons();
-        let residue = self.key_injector.release_all();
-        self.physical_modifiers.set(PhysicalModifiers::empty());
-        self.modifier_state.set(XMods::empty());
-        log_cleanup_end(session, None, "terminate", residue);
+        if let Err(error) = self.cleanup_input(None, "terminate") {
+            log::warn!("final macOS input cleanup failed: {error}");
+        }
+    }
+
+    async fn stop_repeat(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        self.cancel_repeat_task(RepeatStopReason::ControlLeft).await
+    }
+
+    async fn release_pending(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        self.cleanup_input(Some(handle), "release")
     }
 
     async fn quiesce(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {

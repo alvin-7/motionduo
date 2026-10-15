@@ -23,6 +23,15 @@ graph TD
 The input component is responsible for translating inputs from a given backend
 to a standardized format and passing them to the event emitter.
 
+#### macOS capture lifecycle synchronization
+
+Each newly registered macOS capture edge queues a fresh WindowServer lock-state
+snapshot before the event tap can emit `Begin` for that edge. This initial
+snapshot bypasses transition deduplication: an unlock while disconnected must
+not leave the capture task stuck in `Locked` after reconnection. Registration
+while locked still publishes `Locked`; reconnecting does not bypass the lock
+gate. The four-key forced-release shortcut is independent of normal edge return.
+
 #### macOS receiver keyboard injection
 
 On macOS the receiving side posts forwarded keyboard input as HID-level events:
@@ -243,6 +252,33 @@ their separate 300 ms constants. Negotiated recovery bypasses Legacy watchdogs
 and the receiver's independent 1-second ownership timeout. Actual DTLS I/O errors,
 permanent writes, integrity violations, resource exhaustion and unsafe backends
 still fail closed. Tests do not establish two-machine or field acceptance.
+
+## Held Input Cleanup
+
+The receiving endpoint keeps a per-handle set of forwarded keys and mouse
+buttons. Repeated key-downs do not create extra entries; there is no ten-key
+limit that could discard a still-held key. Normal return, forced release and
+disconnect all retire the receiving handle through the same cleanup path.
+
+Cleanup stops background key repeat first, publishes a zero remote modifier
+snapshot, then releases recorded keys and buttons. The macOS backend also checks
+its native injector for remaining input, using its existing local-modifier
+preservation policy rather than resetting all system keys. Only successful
+releases remove records. A failed destroy retains the handle in a pending
+cleanup set; `InputEmulation::destroy` now returns a `Result` and
+`InputEmulation::retry_cleanup` retries these retired handles.
+
+The serial emulation worker retries before subsequent requests and on its
+two-second display poll when idle. While cleanup is failing, it rejects new
+input, recovery requests and entry warps instead of injecting over stale state
+or destroying/recreating the backend. Input during this interval is discarded,
+not replayed later. Final process termination makes a last cleanup attempt and
+logs failures; it cannot guarantee release if the OS continues rejecting input.
+
+Sender key-ups remain best-effort and scoped to the old connection/handover;
+receiver teardown is authoritative. No old key-up is replayed into a new
+session. This improves cleanup reliability but does not establish that stale
+macOS combined-session flags are the cause of a particular live reentry issue.
 
 ## Problems
 

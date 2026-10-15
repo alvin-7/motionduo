@@ -506,6 +506,7 @@ impl InputCaptureState {
     async fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
+        initial_state_slot: Option<mpsc::Permit<'_, (Position, CaptureEvent)>>,
     ) -> Result<ProducerOutcome, CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         let mut outcome = ProducerOutcome::default();
@@ -554,7 +555,18 @@ impl InputCaptureState {
                 }
             }
             ProducerEvent::Create(p) => {
-                self.active_clients.insert(p);
+                let observed = if is_screen_locked() {
+                    HostInputState::Locked
+                } else {
+                    HostInputState::Unlocked
+                };
+                activate_capture_edge(
+                    &mut self.active_clients,
+                    p,
+                    observed,
+                    initial_state_slot.expect("Create reserves a host-state event slot"),
+                );
+                outcome.host_input_state = Some(observed);
             }
             ProducerEvent::Destroy(p) => {
                 self.active_clients.remove(&p);
@@ -671,6 +683,19 @@ impl InputCaptureState {
         };
         Ok(outcome)
     }
+}
+
+fn activate_capture_edge(
+    active_clients: &mut HashSet<Position>,
+    pos: Position,
+    state: HostInputState,
+    event_slot: mpsc::Permit<'_, (Position, CaptureEvent)>,
+) {
+    // A lock/unlock transition can be lost while there are no edges to route it
+    // through. Replay a fresh snapshot even when the producer's cache agrees.
+    // Queue it under the callback's state lock, before enabling Begin events.
+    event_slot.send((pos, CaptureEvent::HostInputState(state)));
+    active_clients.insert(pos);
 }
 
 async fn publish_host_input_state(
@@ -1631,11 +1656,13 @@ fn is_mousehop_keep_awake_event(event: &CGEvent) -> bool {
     event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == MACOS_KEEP_AWAKE_EVENT_TAG
 }
 
+type EventTapReady = Result<(CFRunLoop, Arc<OnceLock<usize>>), MacosCaptureCreationError>;
+
 fn event_tap_thread(
     client_state: Arc<Mutex<InputCaptureState>>,
     event_tx: Sender<(Position, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
-    ready: std::sync::mpsc::Sender<Result<CFRunLoop, MacosCaptureCreationError>>,
+    ready: std::sync::mpsc::Sender<EventTapReady>,
     exit: oneshot::Sender<()>,
 ) {
     // Clone now: create_event_tap consumes notify_tx into its closure.
@@ -1648,7 +1675,9 @@ fn event_tap_thread(
         }
         Ok((tap, port)) => {
             let run_loop = CFRunLoop::get_current();
-            ready.send(Ok(run_loop)).expect("channel closed");
+            ready
+                .send(Ok((run_loop, Arc::clone(&port))))
+                .expect("channel closed");
             (tap, port)
         }
     };
@@ -1970,7 +1999,7 @@ impl MacOSInputCapture {
         });
 
         // wait for event tap creation result
-        let run_loop = ready_rx.recv().expect("channel closed")?;
+        let (run_loop, tap_mach_port) = ready_rx.recv().expect("channel closed")?;
 
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             let mut last_host_input_state = HostInputState::Unlocked;
@@ -2002,8 +2031,18 @@ impl MacOSInputCapture {
                             } => Some(*recovery_generation),
                             _ => None,
                         };
+                        // Reserve before taking the event-tap mutex: channel
+                        // backpressure must not block the native callback.
+                        let initial_state_slot = if matches!(&producer_event, ProducerEvent::Create(_)) {
+                            match lifecycle_event_tx.reserve().await {
+                                Ok(slot) => Some(slot),
+                                Err(_) => break,
+                            }
+                        } else {
+                            None
+                        };
                         let mut capture_state = state.lock().await;
-                        let outcome = match capture_state.handle_producer_event(producer_event).await {
+                        let outcome = match capture_state.handle_producer_event(producer_event, initial_state_slot).await {
                             Ok(outcome) => outcome,
                             Err(e) => {
                                 log::error!("Failed to handle producer event: {e}");
@@ -2075,6 +2114,14 @@ impl MacOSInputCapture {
                             (observed, state.active_clients.iter().copied().collect())
                         });
                         drop(state);
+                        if observed == HostInputState::Unlocked {
+                            if let Some(&port) = tap_mach_port.get() {
+                                if !unsafe { CGEventTapIsEnabled(port as *mut c_void) } {
+                                    log::info!("screen unlocked with disabled CGEventTap; re-enabling");
+                                    unsafe { CGEventTapEnable(port as *mut c_void, true) };
+                                }
+                            }
+                        }
                         if let Some((next, positions)) = transition {
                             publish_host_input_state(&lifecycle_event_tx, positions, next).await;
                         }
@@ -2120,6 +2167,137 @@ where
         return Err(MacosCaptureCreationError::InputMonitoringPermission);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::{Backend, InputCapture};
+    use futures::StreamExt;
+
+    struct QueuedCapture(Receiver<(Position, CaptureEvent)>);
+
+    impl Stream for QueuedCapture {
+        type Item = Result<(Position, CaptureEvent), CaptureError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0.poll_recv(cx).map(|event| event.map(Ok))
+        }
+    }
+
+    #[async_trait]
+    impl Capture for QueuedCapture {
+        async fn create(&mut self, _: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn destroy(&mut self, _: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn release(&mut self, _: Option<(i32, i32)>) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn set_crossing_modifier(
+            &mut self,
+            _: Position,
+            _: Option<CrossingModifier>,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    async fn next_event(capture: &mut InputCapture) -> (u64, CaptureEvent) {
+        tokio::time::timeout(Duration::from_secs(1), capture.next())
+            .await
+            .expect("capture event timed out")
+            .expect("capture stream closed")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_unlock_lost_without_edges_before_begin() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut capture = InputCapture::new(Some(Backend::Dummy)).await.unwrap();
+        capture.capture = Box::new(QueuedCapture(rx));
+        let mut active = HashSet::from([Position::Left]);
+        capture.create(1, Position::Left).await.unwrap();
+        publish_host_input_state(
+            &tx,
+            active.iter().copied().collect(),
+            HostInputState::Locked,
+        )
+        .await;
+        assert!(matches!(
+            next_event(&mut capture).await,
+            (1, CaptureEvent::HostInputState(HostInputState::Locked))
+        ));
+
+        capture.destroy(1).await.unwrap();
+        active.clear();
+        // The producer observes Unlocked, but no handle receives this transition.
+        publish_host_input_state(&tx, vec![], HostInputState::Unlocked).await;
+        capture.create(2, Position::Left).await.unwrap();
+        activate_capture_edge(
+            &mut active,
+            Position::Left,
+            HostInputState::Unlocked,
+            tx.reserve().await.unwrap(),
+        );
+        assert!(active.contains(&Position::Left));
+        tx.send((
+            Position::Left,
+            CaptureEvent::Begin {
+                cursor: None,
+                normalized_cursor: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            next_event(&mut capture).await,
+            (2, CaptureEvent::HostInputState(HostInputState::Unlocked))
+        ));
+        assert!(matches!(
+            next_event(&mut capture).await,
+            (2, CaptureEvent::Begin { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn registration_replays_even_unchanged_locked_state_to_shared_handles() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut capture = InputCapture::new(Some(Backend::Dummy)).await.unwrap();
+        capture.capture = Box::new(QueuedCapture(rx));
+        let mut active = HashSet::from([Position::Right]);
+        for _ in 0..2 {
+            capture.create(1, Position::Left).await.unwrap();
+            capture.create(2, Position::Left).await.unwrap();
+            activate_capture_edge(
+                &mut active,
+                Position::Left,
+                HostInputState::Locked,
+                tx.reserve().await.unwrap(),
+            );
+            assert!(
+                active.contains(&Position::Right),
+                "registration preserves other edges"
+            );
+            for handle in [1, 2] {
+                let (id, event) = next_event(&mut capture).await;
+                assert_eq!(id, handle);
+                assert!(matches!(
+                    event,
+                    CaptureEvent::HostInputState(HostInputState::Locked)
+                ));
+            }
+            capture.destroy(1).await.unwrap();
+            capture.destroy(2).await.unwrap();
+            active.remove(&Position::Left);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3051,6 +3229,7 @@ extern "C" {
     /// argument is a `CFMachPortRef`; we pass the raw pointer so we
     /// can store it as `usize` for cross-thread sharing.
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+    fn CGEventTapIsEnabled(tap: *mut c_void) -> bool;
 
     /// Register a callback invoked when the display configuration
     /// changes (monitor add/remove, resolution change, mirror,

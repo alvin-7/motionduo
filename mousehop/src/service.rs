@@ -1067,6 +1067,11 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
+            ICaptureEvent::HostInputState(input_capture::HostInputState::Unlocked) => {
+                log::info!("host unlocked; re-enabling input emulation");
+                self.emulation.reenable();
+            }
+            ICaptureEvent::HostInputState(input_capture::HostInputState::Locked) => {}
             ICaptureEvent::CaptureBegin { handle, handover } => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released

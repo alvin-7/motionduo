@@ -153,6 +153,7 @@ impl Default for ReceivePostProcessing {
 pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
+    pending_cleanup: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
     pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
     /// Per-handle receive-side post-processing. Populated by the
@@ -199,6 +200,7 @@ impl InputEmulation {
         Ok(Self {
             emulation,
             handles: HashSet::new(),
+            pending_cleanup: HashSet::new(),
             pressed_keys: HashMap::new(),
             pressed_buttons: HashMap::new(),
             post_processing: HashMap::new(),
@@ -259,6 +261,10 @@ impl InputEmulation {
                     log::warn!("failed to set clipboard: {e}");
                 }
             }
+            return Ok(());
+        }
+        self.retry_cleanup().await?;
+        if !self.handles.contains(&handle) {
             return Ok(());
         }
         // Apply per-handle receive-side post-processing in a single
@@ -379,19 +385,40 @@ impl InputEmulation {
         }
     }
 
-    pub async fn destroy(&mut self, handle: EmulationHandle) {
-        let _ = self.release_keys(handle).await;
-        if self.handles.remove(&handle) {
-            self.pressed_keys.remove(&handle);
-            self.pressed_buttons.remove(&handle);
-            self.post_processing.remove(&handle);
-            self.emulation.destroy(handle).await
+    /// Retire a handle only after its outstanding input has been released.
+    /// Failed cleanup is retried before any subsequent input is injected.
+    pub async fn destroy(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        if !self.handles.contains(&handle) {
+            return Ok(());
         }
+        self.pending_cleanup.insert(handle);
+        self.release_keys(handle).await?;
+        self.emulation.destroy(handle).await;
+        self.handles.remove(&handle);
+        self.pending_cleanup.remove(&handle);
+        self.pressed_keys.remove(&handle);
+        self.pressed_buttons.remove(&handle);
+        self.post_processing.remove(&handle);
+        Ok(())
+    }
+
+    /// The native backend may share keyboard state across handles. Do not
+    /// inject into a replacement handle while any retired handle is unclean.
+    pub async fn retry_cleanup(&mut self) -> Result<(), EmulationError> {
+        let mut failure = None;
+        for handle in self.pending_cleanup.iter().copied().collect::<Vec<_>>() {
+            if let Err(error) = self.destroy(handle).await {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     pub async fn terminate(&mut self) {
         for handle in self.handles.iter().cloned().collect::<Vec<_>>() {
-            self.destroy(handle).await
+            if let Err(error) = self.destroy(handle).await {
+                log::warn!("input cleanup pending for handle {handle}: {error}");
+            }
         }
         self.emulation.terminate().await
     }
@@ -413,6 +440,7 @@ impl InputEmulation {
     /// Warp the local cursor to the given absolute position. See
     /// `Emulation::warp_cursor`.
     pub async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
+        self.retry_cleanup().await?;
         self.emulation.warp_cursor(x, y).await
     }
 
@@ -425,6 +453,7 @@ impl InputEmulation {
         edge: DisplayEdge,
         cross_fraction: f64,
     ) -> Result<EdgeWarpOutcome, EmulationError> {
+        self.retry_cleanup().await?;
         if !self.emulation.supports_edge_warp() {
             return Ok(EdgeWarpOutcome::Unsupported);
         }
@@ -445,7 +474,10 @@ impl InputEmulation {
     }
 
     pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
-        let mut failure = None;
+        if !self.handles.contains(&handle) {
+            return Ok(());
+        }
+        let mut failure = self.emulation.stop_repeat(handle).await.err();
         // Reset the aggregate state in one backend transition before key-ups.
         // macOS reads combined flags on each transition; individual modifier
         // releases can otherwise reclassify a just-released remote flag as local.
@@ -492,6 +524,9 @@ impl InputEmulation {
             }
         }
 
+        if let Err(error) = self.emulation.release_pending(handle).await {
+            failure = Some(error);
+        }
         failure.map_or(Ok(()), Err)
     }
 
@@ -507,6 +542,7 @@ impl InputEmulation {
         &mut self,
         handle: EmulationHandle,
     ) -> Result<RecoveryBaseline, EmulationError> {
+        self.retry_cleanup().await?;
         if !self.handles.contains(&handle) {
             return Err(EmulationError::EndOfStream);
         }
@@ -577,6 +613,14 @@ impl InputEmulation {
 
 #[async_trait]
 trait Emulation: Send {
+    /// Backends without background injection have nothing to stop.
+    async fn stop_repeat(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        Ok(())
+    }
+    /// Retry backend-owned native residues not represented by abstract keys.
+    async fn release_pending(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        Ok(())
+    }
     /// Stop and join all background injection for this handle. Unsupported
     /// backends must not certify a recovery barrier.
     async fn quiesce(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
@@ -649,6 +693,231 @@ trait Emulation: Send {
     }
 }
 
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct FailingReleaseBackend {
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Emulation for FailingReleaseBackend {
+        async fn consume(
+            &mut self,
+            event: Event,
+            _handle: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed)
+                && matches!(
+                    event,
+                    Event::Keyboard(KeyboardEvent::Key { state: 0, .. })
+                        | Event::Pointer(PointerEvent::Button { state: 0, .. })
+                )
+            {
+                return Err(EmulationError::Io(std::io::Error::other("release failed")));
+            }
+            Ok(())
+        }
+        async fn create(&mut self, _: EmulationHandle) {}
+        async fn destroy(&mut self, _: EmulationHandle) {}
+        async fn terminate(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn failed_destroy_retains_held_input_until_retry_succeeds() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut emulation = InputEmulation {
+            emulation: Box::new(FailingReleaseBackend { fail: fail.clone() }),
+            handles: HashSet::new(),
+            pending_cleanup: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+            post_processing: HashMap::new(),
+            clipboard: None,
+        };
+        emulation.create(1).await;
+        for key in 2..18 {
+            for _ in 0..2 {
+                emulation
+                    .consume(
+                        Event::Keyboard(KeyboardEvent::Key {
+                            time: 0,
+                            key,
+                            state: 1,
+                        }),
+                        1,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(emulation.pressed_keys[&1].len(), 16);
+        emulation
+            .consume(
+                Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button: input_event::BTN_LEFT,
+                    state: 1,
+                }),
+                1,
+            )
+            .await
+            .unwrap();
+        fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(emulation.destroy(1).await.is_err());
+        assert!(emulation.handles.contains(&1));
+        assert_eq!(emulation.pressed_keys[&1].len(), 16);
+        assert!(emulation.pressed_buttons[&1].contains(&input_event::BTN_LEFT));
+        emulation.create(2).await;
+        assert!(
+            emulation
+                .consume(
+                    Event::Keyboard(KeyboardEvent::Key {
+                        time: 0,
+                        key: 30,
+                        state: 1
+                    }),
+                    2
+                )
+                .await
+                .is_err()
+        );
+        assert!(!emulation.has_pressed_keys(2));
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        emulation.retry_cleanup().await.unwrap();
+        assert!(!emulation.handles.contains(&1));
+        assert!(!emulation.pressed_keys.contains_key(&1));
+        assert!(!emulation.pressed_buttons.contains_key(&1));
+        emulation
+            .consume(
+                Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: 30,
+                    state: 1,
+                }),
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(emulation.has_pressed_keys(2));
+    }
+
+    struct NativeCleanupBackend {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Emulation for NativeCleanupBackend {
+        async fn stop_repeat(&mut self, _: EmulationHandle) -> Result<(), EmulationError> {
+            self.calls.lock().unwrap().push("stop_repeat");
+            Ok(())
+        }
+        async fn release_pending(&mut self, _: EmulationHandle) -> Result<(), EmulationError> {
+            self.calls.lock().unwrap().push("native_cleanup");
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                Err(EmulationError::Io(std::io::Error::other("native residue")))
+            } else {
+                Ok(())
+            }
+        }
+        async fn consume(
+            &mut self,
+            event: Event,
+            _: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            self.calls.lock().unwrap().push(match event {
+                Event::Keyboard(KeyboardEvent::Modifiers { depressed: 0, .. }) => "zero",
+                Event::Keyboard(KeyboardEvent::Key { state: 0, .. }) => "key_up",
+                _ => "new_input",
+            });
+            Ok(())
+        }
+        async fn create(&mut self, _: EmulationHandle) {}
+        async fn destroy(&mut self, _: EmulationHandle) {
+            self.calls.lock().unwrap().push("destroy");
+        }
+        async fn terminate(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn native_residue_blocks_reentry_even_after_abstract_keys_are_released() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut emulation = InputEmulation {
+            emulation: Box::new(NativeCleanupBackend {
+                calls: calls.clone(),
+                fail: fail.clone(),
+            }),
+            handles: HashSet::new(),
+            pending_cleanup: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+            post_processing: HashMap::new(),
+            clipboard: None,
+        };
+        emulation.create(1).await;
+        emulation.pressed_keys.get_mut(&1).unwrap().insert(29);
+        assert!(emulation.destroy(1).await.is_err());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["stop_repeat", "zero", "key_up", "native_cleanup"]
+        );
+        assert!(!emulation.has_pressed_keys(1));
+        assert!(emulation.pending_cleanup.contains(&1));
+
+        emulation.create(2).await;
+        let key_down = Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 1,
+        });
+        calls.lock().unwrap().clear();
+        assert!(emulation.consume(key_down.clone(), 2).await.is_err());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["stop_repeat", "zero", "native_cleanup"]
+        );
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        calls.lock().unwrap().clear();
+        emulation.consume(key_down, 2).await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "stop_repeat",
+                "zero",
+                "native_cleanup",
+                "destroy",
+                "new_input"
+            ]
+        );
+        assert!(emulation.pending_cleanup.is_empty());
+    }
+
+    #[tokio::test]
+    async fn destroying_unknown_handle_injects_nothing() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut emulation = InputEmulation {
+            emulation: Box::new(NativeCleanupBackend {
+                calls: recorded.clone(),
+                fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            handles: HashSet::new(),
+            pending_cleanup: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+            post_processing: HashMap::new(),
+            clipboard: None,
+        };
+        emulation.create(1).await;
+        emulation.destroy(2).await.unwrap();
+        assert!(recorded.lock().unwrap().is_empty());
+        assert!(emulation.handles.contains(&1));
+    }
+}
+
 #[cfg(all(test, not(target_os = "macos")))]
 mod scroll_inertia_tests {
     use super::*;
@@ -660,6 +929,7 @@ mod scroll_inertia_tests {
         let mut emulation = InputEmulation {
             emulation: Box::new(RecordingBackend(recorded.clone())),
             handles: HashSet::new(),
+            pending_cleanup: HashSet::new(),
             pressed_keys: HashMap::new(),
             pressed_buttons: HashMap::new(),
             post_processing: HashMap::new(),
@@ -711,6 +981,7 @@ mod scroll_inertia_tests {
         let mut emulation = InputEmulation {
             emulation: Box::new(RecordingBackend(recorded.clone())),
             handles: HashSet::new(),
+            pending_cleanup: HashSet::new(),
             pressed_keys: HashMap::new(),
             pressed_buttons: HashMap::new(),
             post_processing: HashMap::new(),
@@ -730,7 +1001,7 @@ mod scroll_inertia_tests {
                 .await
                 .unwrap();
         }
-        emulation.destroy(1).await;
+        emulation.destroy(1).await.unwrap();
         assert!(!emulation.has_pressed_keys(1));
         assert!(emulation.has_pressed_keys(2));
         let released = |handle| {
@@ -765,6 +1036,7 @@ mod scroll_inertia_tests {
         let mut emulation = InputEmulation {
             emulation: Box::new(RecordingBackend(recorded.clone())),
             handles: HashSet::new(),
+            pending_cleanup: HashSet::new(),
             pressed_keys: HashMap::new(),
             pressed_buttons: HashMap::new(),
             post_processing: HashMap::new(),
@@ -837,6 +1109,7 @@ mod scroll_inertia_tests {
         let mut emulation = InputEmulation {
             emulation: Box::new(RecordingBackend(recorded.clone())),
             handles: HashSet::new(),
+            pending_cleanup: HashSet::new(),
             pressed_keys: HashMap::new(),
             pressed_buttons: HashMap::new(),
             post_processing: HashMap::new(),

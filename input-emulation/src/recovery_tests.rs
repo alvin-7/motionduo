@@ -87,6 +87,7 @@ impl Emulation for BackendMock {
 
 fn emulation(state: Arc<Mutex<State>>) -> InputEmulation {
     InputEmulation {
+        pending_cleanup: HashSet::new(),
         emulation: Box::new(BackendMock {
             state,
             blocked: None,

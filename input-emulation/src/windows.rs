@@ -161,6 +161,10 @@ impl Emulation for WindowsEmulation {
     }
 
     async fn quiesce(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        self.stop_repeat(handle).await
+    }
+
+    async fn stop_repeat(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
         self.kill_repeat_task(handle).await
     }
 

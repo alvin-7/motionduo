@@ -35,6 +35,7 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
+    HostInputState(HostInputState),
     /// A capture barrier was entered. `handover` is true when a Default
     /// capture shares the edge, so the EnterOnly return will be followed by
     /// this device's own Enter + CursorPos rather than ending at a local
@@ -2065,6 +2066,9 @@ impl CaptureTask {
         }
         self.host_input_state = state;
         self.host_input_generation = self.host_input_generation.wrapping_add(1);
+        self.event_tx
+            .send(ICaptureEvent::HostInputState(state))
+            .expect("channel closed");
 
         match state {
             HostInputState::Locked => {
@@ -2427,6 +2431,59 @@ mod command_ctrl_tests {
             key: key as u32,
             state,
         })
+    }
+
+    #[tokio::test]
+    async fn reconnect_host_snapshot_unblocks_return_without_bypassing_lock() {
+        let mut task = capture_task(None);
+        let (event_tx, mut event_rx) = channel();
+        task.event_tx = event_tx;
+        task.host_input_state = HostInputState::Locked;
+        task.add_capture(7, Position::Left, CaptureType::EnterOnly, false, None);
+        *task.release_bind.borrow_mut() = vec![KeyLeftCtrl];
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .unwrap();
+        let begin = CaptureEvent::Begin {
+            cursor: None,
+            normalized_cursor: None,
+        };
+
+        // Reconnecting while still locked must not produce a return handoff.
+        task.handle_accepted_capture_event(
+            &mut capture,
+            (7, CaptureEvent::HostInputState(HostInputState::Locked)),
+        )
+        .await
+        .unwrap();
+        task.handle_accepted_capture_event(&mut capture, (7, begin.clone()))
+            .await
+            .unwrap();
+        assert!(event_rx.recv().now_or_never().is_none());
+
+        // The fresh registration snapshot repairs an unlock lost while disconnected.
+        task.handle_accepted_capture_event(
+            &mut capture,
+            (7, CaptureEvent::HostInputState(HostInputState::Unlocked)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            event_rx.recv().now_or_never(),
+            Some(Some(ICaptureEvent::HostInputState(
+                HostInputState::Unlocked
+            )))
+        ));
+        task.handle_accepted_capture_event(&mut capture, (7, begin))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().now_or_never(),
+            Some(Some(ICaptureEvent::CaptureBegin {
+                handle: 7,
+                handover: false
+            }))
+        ));
     }
 
     #[test]

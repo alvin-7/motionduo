@@ -595,7 +595,7 @@ fn lost_input_with_only_progress_alive_still_closes_receiver() {
 
 #[test]
 fn seeded_loss_matrix_reports_input_latency_and_legacy_loss() {
-    for threshold in [200, 300, 500] {
+    for threshold in [200, 300, 500, 600] {
         for loss in [1u32, 5, 10] {
             let (mut a, mut b) = pair();
             a.set_stall_ms(threshold);

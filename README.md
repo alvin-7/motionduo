@@ -649,6 +649,11 @@ with a configuration error. Restart Mousehop after editing these settings.
 They apply to every local KCP session, incoming and outgoing;
 configure and restart the controller and receiver separately. Raising only one
 side's timeout does not extend the other side's protection. Legacy is unaffected.
+Upgrades preserve explicit values in existing configuration files. If an older
+installation still has `kcp_stall_timeout_ms = 300`, change it to `600` on both
+endpoints and restart both processes to use the current deployment baseline.
+This changes recovery tolerance, not the normal input delivery or KCP retransmit
+interval; other transport parameters remain unchanged.
 Increasing the input deadline delays recovery from stalled input. Increasing the
 peer deadline delays cleanup after total silence, including release of already
 held keys/buttons. Very small values can expire before normal feedback (sent every

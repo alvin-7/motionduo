@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.16] - 2026-10-15
+
+### Changed
+
+- Make the existing 600ms KCP input-stall baseline explicit in the example configuration and document updating older, explicitly configured 300ms installations on both endpoints. Preserve the 3000ms peer deadline and all KCP/UDP transport parameters.
+
 ## [0.17.15] - 2026-10-15
 
 ### Fixed

@@ -1,5 +1,10 @@
 # example configuration
 
+# KCP input-progress and peer-silence deadlines, in milliseconds.
+# Restart both endpoints after changing their local configuration.
+kcp_stall_timeout_ms = 600
+kcp_peer_timeout_ms = 3000
+
 # configure release bind
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 

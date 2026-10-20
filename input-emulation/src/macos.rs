@@ -26,7 +26,8 @@ use tokio::task::JoinHandle;
 use super::error::MacOSEmulationCreationError;
 use crate::macos_keyboard::{
     CleanupResidue, Injection, InjectionPath, KEYBOARD_LOG_TARGET, KeySink, KeyboardInjector,
-    ModifierKinds, ModifierSides, describe_sides, key_category, path_name,
+    ModifierKinds, ModifierSide, ModifierSides, describe_sides, flags_for, key_category, path_name,
+    wait_modifier_releases,
 };
 
 /// Fallback initial key-repeat delay used only when the host's
@@ -333,7 +334,7 @@ impl MacOSEmulation {
     /// so the current sides are passed alongside the aggregate and the
     /// window server's own flags are read first so a locally held modifier is
     /// not cleared by a remote transition.
-    fn sync_remote_modifiers(&self) -> Result<(), EmulationError> {
+    async fn sync_remote_modifiers(&mut self) -> Result<(), EmulationError> {
         if !self.key_injector.sync_modifiers(
             modifier_kinds(self.modifier_state.get()),
             modifier_sides(self.physical_modifiers.get()),
@@ -343,7 +344,39 @@ impl MacOSEmulation {
                 "macOS modifier transition failed",
             )));
         }
-        Ok(())
+        self.finish_modifier_releases().await
+    }
+
+    fn modifier_release_step(&mut self, retry: bool) -> Result<bool, i32> {
+        self.key_injector.modifier_release_step(retry)
+    }
+
+    async fn finish_modifier_releases(&mut self) -> Result<(), EmulationError> {
+        match wait_modifier_releases(|retry| self.modifier_release_step(retry)).await {
+            Ok(true) => {
+                log::debug!(target: KEYBOARD_LOG_TARGET,
+                    "event=modifier_release_confirmed session={} observed_source=hid_and_combined",
+                    self.key_injector.session());
+                Ok(())
+            }
+            Ok(false) => {
+                log::warn!(target: KEYBOARD_LOG_TARGET,
+                    "event=modifier_release_unconfirmed session={} pending_sides={} note=retained_for_cleanup",
+                    self.key_injector.session(), describe_sides(self.key_injector.pending().modifier_sides));
+                Err(EmulationError::Io(std::io::Error::other(
+                    "macOS modifier release not confirmed; retained for retry",
+                )))
+            }
+            Err(status) => Err(EmulationError::KeyboardInjection(status)),
+        }
+    }
+
+    fn post_pointer_event(&self, event: &CGEvent) {
+        let flags = self
+            .key_injector
+            .pointer_event_flags(event.get_flags().bits(), local_modifier_flags());
+        event.set_flags(CGEventFlags::from_bits_retain(flags));
+        event.post(CGEventTapLocation::HID);
     }
 
     /// Tell the macOS power-manager that real user input is arriving
@@ -421,7 +454,7 @@ impl MacOSEmulation {
         if let Some(button_number) = spec.button_number {
             event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button_number);
         }
-        event.post(CGEventTapLocation::HID);
+        self.post_pointer_event(&event);
         true
     }
 
@@ -443,7 +476,7 @@ impl MacOSEmulation {
         }
     }
 
-    fn cleanup_input(
+    async fn cleanup_input(
         &mut self,
         handle: Option<EmulationHandle>,
         source: &str,
@@ -457,8 +490,11 @@ impl MacOSEmulation {
             self.key_injector.current_path(),
         );
         self.release_tracked_buttons();
-        let residue = self.key_injector.release_all();
+        self.key_injector.release_all();
+        let confirmation = self.finish_modifier_releases().await;
+        let residue = self.key_injector.pending();
         log_cleanup_end(session, handle, source, residue);
+        confirmation?;
         if !residue.is_empty() || !self.pressed_buttons.is_empty() {
             return Err(EmulationError::Io(std::io::Error::other(
                 "macOS input release incomplete; retained for retry",
@@ -630,6 +666,7 @@ extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
     /// Modifier flags of an event-source state (`CGEventSourceFlagsState`).
     fn CGEventSourceFlagsState(state_id: c_int) -> u64;
+    fn CGEventSourceKeyState(state_id: c_int, key: CGKeyCode) -> bool;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -778,6 +815,22 @@ impl MacKeySink {
 }
 
 impl KeySink for MacKeySink {
+    fn modifier_flags(&self) -> Option<u32> {
+        let mut flags = 0;
+        for source in [
+            CGEventSourceStateID::HIDSystemState,
+            CGEventSourceStateID::CombinedSessionState,
+        ] {
+            flags |= unsafe { CGEventSourceFlagsState(source as c_int) as u32 };
+            for side in ModifierSide::ALL {
+                if unsafe { CGEventSourceKeyState(source as c_int, side.key_code()) } {
+                    flags |= flags_for(side.bit());
+                }
+            }
+        }
+        Some(flags)
+    }
+
     fn preferred_path(&self) -> InjectionPath {
         if self.driver.is_some() {
             InjectionPath::Nx
@@ -947,7 +1000,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
-                        event.post(CGEventTapLocation::HID);
+                        self.post_pointer_event(&event);
                     }
                     PointerEvent::Button {
                         time: _,
@@ -999,7 +1052,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        self.post_pointer_event(&event);
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
@@ -1025,7 +1078,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        self.post_pointer_event(&event);
                     }
                 }
 
@@ -1076,7 +1129,7 @@ impl Emulation for MacOSEmulation {
                         // repeatable characters: one flags-changed event that
                         // carries the real key code of the side that changed,
                         // and no duplicate key event on top of it.
-                        self.sync_remote_modifiers()?;
+                        self.sync_remote_modifiers().await?;
                         return Ok(());
                     }
                     match state {
@@ -1099,7 +1152,7 @@ impl Emulation for MacOSEmulation {
                         locked,
                         group,
                     );
-                    self.sync_remote_modifiers()?;
+                    self.sync_remote_modifiers().await?;
                 }
             },
             Event::Clipboard(_) => {
@@ -1133,7 +1186,7 @@ impl Emulation for MacOSEmulation {
                  status={status}"
             );
         }
-        if let Err(error) = self.cleanup_input(None, "terminate") {
+        if let Err(error) = self.cleanup_input(None, "terminate").await {
             log::warn!("final macOS input cleanup failed: {error}");
         }
     }
@@ -1143,7 +1196,7 @@ impl Emulation for MacOSEmulation {
     }
 
     async fn release_pending(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
-        self.cleanup_input(Some(handle), "release")
+        self.cleanup_input(Some(handle), "release").await
     }
 
     async fn quiesce(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {

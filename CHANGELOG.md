@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.17] - 2026-10-20
+
+### Fixed
+
+- Retain macOS remote modifier-release ownership until a bounded asynchronous
+  retry and HID/session readback confirm the released side cleared. Keep failed
+  or timed-out releases in cleanup residue instead of reporting a clean state.
+- Explicitly reconcile movement, button/drag and scroll modifier flags with the
+  current remote plan and distinguishable local input, rather than inheriting
+  stale remote Ctrl flags. Preserve local opposite-side modifiers.
+
+### Validation
+
+- Add twelve modifier regressions covering delayed release, stale pointer flags,
+  sibling preservation, re-press, idle release, timeout, API failure,
+  cancellation and chord cleanup. Real dual-machine acceptance remains a
+  separate check; automated tests alone do not prove the intermittent issue is
+  eliminated.
+
 ## [0.17.16] - 2026-10-15
 
 ### Changed

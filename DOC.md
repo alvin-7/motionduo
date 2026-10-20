@@ -59,6 +59,19 @@ shortcuts. A release that fails on both paths is propagated as an emulation
 error: the emulation session stops instead of silently holding the key, and
 its shutdown cleanup retries the release.
 
+Remote modifier releases are not considered complete solely because an API
+accepted them. The backend retains ownership of released sides, posts an
+idempotent `CGEvent` release after older CG pointer events, and asynchronously
+checks both HID and combined-session flags/key state. Readback/retry is bounded
+to 20 attempts with 5 ms asynchronous sleeps; an unconfirmed release remains in
+cleanup residue and is reported as an emulation error rather than `clean`.
+This also runs if the sender becomes idle immediately after releasing Ctrl.
+Movement, button/drag and both scroll paths explicitly combine the current
+remote modifier plan with fresh, distinguishable local modifiers instead of
+inheriting potentially stale remote flags from their event source. Unrelated
+event flags and a distinguishable local opposite-side modifier are preserved.
+Same-side simultaneous local/remote ownership remains ambiguous as noted above.
+
 ##### macOS keyboard diagnostics
 
 Detailed keyboard logs are disabled by default. To troubleshoot the receiving

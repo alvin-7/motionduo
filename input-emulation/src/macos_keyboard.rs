@@ -463,7 +463,15 @@ pub(crate) fn desired_sides(aggregate: ModifierKinds, known: ModifierSides) -> M
 /// Control that the local user is still holding; releasing that physical key
 /// still clears the bit.
 pub(crate) fn locally_held_flags(local_flags: u32, remote_flags: u32) -> u32 {
-    local_flags & !remote_flags & MANAGED_FLAG_MASKS
+    let mut local = local_flags & !remote_flags & MANAGED_FLAG_MASKS;
+    // The aggregate bit is shared by both sides. Removing the remote side
+    // must not remove the aggregate bit required by a distinguishable local side.
+    for side in ModifierSide::ALL {
+        if local & side.device_mask() != 0 {
+            local |= side.general_mask();
+        }
+    }
+    local
 }
 
 /// The modifier transitions that take `held` to `desired`, in the order they
@@ -537,6 +545,30 @@ pub(crate) trait KeySink {
 
     /// Posts one injection, returning the raw platform status on failure.
     fn inject(&self, path: InjectionPath, injection: Injection) -> Result<(), i32>;
+
+    /// Combined HID/session modifier observations. Pure planning sinks may
+    /// omit readback; the native macOS sink always supplies it.
+    fn modifier_flags(&self) -> Option<u32> {
+        None
+    }
+}
+
+/// Drive a release even if no more input arrives. The callback is synchronous
+/// so the native worker need not hold a reference into its Rc state across await.
+pub(crate) async fn wait_modifier_releases(
+    mut step: impl FnMut(bool) -> Result<bool, i32>,
+) -> Result<bool, i32> {
+    if step(false)? {
+        return Ok(true);
+    }
+    for _ in 0..20 {
+        step(true)?;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        if step(false)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Input this backend injected and has not confirmed released.
@@ -635,6 +667,9 @@ struct InjectorState {
     held_sides: ModifierSides,
     /// Modifier flags the remote snapshot is responsible for.
     remote_flags: u32,
+    /// Accepted releases still owned until a CG release fence and OS readback.
+    pending_release_sides: ModifierSides,
+    release_fence_sent: bool,
     /// Flags the last successful injection published.
     post_flags: u32,
     /// Modifier flags the local session reported at the last snapshot.
@@ -662,6 +697,8 @@ impl KeyboardInjector {
                 path,
                 held_sides: ModifierSides::default(),
                 remote_flags: 0,
+                pending_release_sides: ModifierSides::default(),
+                release_fence_sent: false,
                 post_flags: 0,
                 local_flags: 0,
                 pressed_keys: BTreeSet::new(),
@@ -687,7 +724,7 @@ impl KeyboardInjector {
         let state = self.state.borrow();
         CleanupResidue {
             pressed_keys: state.pressed_keys.len(),
-            modifier_sides: state.held_sides,
+            modifier_sides: state.held_sides.with(state.pending_release_sides),
         }
     }
 
@@ -708,7 +745,10 @@ impl KeyboardInjector {
         // One baseline for the whole batch: `remote_flags` moves as the steps
         // below are posted, and a per-step baseline would turn the sides this
         // backend has just released into locally held bits.
-        let locally_held = locally_held_flags(local_flags, state.remote_flags);
+        let locally_held = locally_held_flags(
+            local_flags,
+            state.remote_flags | flags_for(state.pending_release_sides),
+        );
         let mut accepted = true;
         for (side, next) in transitions(state.held_sides, desired) {
             let flags = locally_held | flags_for(next);
@@ -722,13 +762,104 @@ impl KeyboardInjector {
                 accepted = false;
                 break;
             }
+            if next.contains(side.bit()) {
+                state.pending_release_sides = state.pending_release_sides.without(side.bit());
+            } else {
+                state.pending_release_sides = state.pending_release_sides.with(side.bit());
+                state.release_fence_sent = false;
+            }
             state.held_sides = next;
             state.remote_flags = flags_for(next);
             state.post_flags = flags;
         }
+        self.confirm_modifier_releases_in(&mut state);
         self.settle(&mut state);
         self.log_snapshot(&mut state, aggregate, known, desired);
         accepted
+    }
+
+    /// Managed flags for a pointer event, not an inherited synthetic snapshot.
+    pub(crate) fn pointer_event_flags(&self, inherited_flags: u64, observed_flags: u32) -> u64 {
+        let state = self.state.borrow();
+        let modifiers = locally_held_flags(
+            observed_flags,
+            state.remote_flags | flags_for(state.pending_release_sides),
+        ) | state.remote_flags;
+        (inherited_flags & !u64::from(MANAGED_FLAG_MASKS)) | u64::from(modifiers)
+    }
+
+    /// A successful post is not an acknowledgement from WindowServer. Keep
+    /// releases pending until older CG events are fenced and both states clear.
+    pub(crate) fn confirm_modifier_releases(&self) -> bool {
+        let mut state = self.state.borrow_mut();
+        self.confirm_modifier_releases_in(&mut state);
+        self.settle(&mut state);
+        state.pending_release_sides.is_empty()
+    }
+
+    fn confirm_modifier_releases_in(&self, state: &mut InjectorState) {
+        if state.pending_release_sides.is_empty() {
+            return;
+        }
+        let Some(observed) = self.sink.modifier_flags() else {
+            state.pending_release_sides = ModifierSides::default();
+            return;
+        };
+        if !state.release_fence_sent {
+            return;
+        }
+        for side in ModifierSide::ALL {
+            let side_held = observed & side.device_mask() != 0;
+            let aggregate_only =
+                observed & side.general_mask() != 0 && observed & side.sibling().device_mask() == 0;
+            if !side_held && !aggregate_only {
+                state.pending_release_sides = state.pending_release_sides.without(side.bit());
+            }
+        }
+    }
+
+    /// Order a release after previously queued CG pointer events. Repeating an
+    /// up is idempotent; never replay a modifier press or release a held sibling.
+    pub(crate) fn retry_modifier_releases(&self) -> Result<(), i32> {
+        let mut state = self.state.borrow_mut();
+        if state.pending_release_sides.is_empty() {
+            return Ok(());
+        }
+        let observed = self.sink.modifier_flags().unwrap_or(state.local_flags);
+        let flags = locally_held_flags(
+            observed,
+            state.remote_flags | flags_for(state.pending_release_sides),
+        ) | state.remote_flags;
+        let path = state.path;
+        for side in ModifierSide::ALL {
+            if state.pending_release_sides.contains(side.bit()) {
+                let injection = Injection::Modifiers {
+                    key_code: side.key_code(),
+                    flags,
+                };
+                self.release(&mut state, path, injection)?;
+                if path == InjectionPath::Nx {
+                    self.release(&mut state, InjectionPath::CgEvent, injection)?;
+                }
+            }
+        }
+        state.post_flags = flags;
+        state.release_fence_sent = true;
+        Ok(())
+    }
+
+    pub(crate) fn modifier_release_step(&self, retry: bool) -> Result<bool, i32> {
+        if retry {
+            self.retry_modifier_releases()?;
+            Ok(false)
+        } else {
+            Ok(self.confirm_modifier_releases())
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_modifier_releases(&self) -> Result<bool, i32> {
+        wait_modifier_releases(|retry| self.modifier_release_step(retry)).await
     }
 
     /// Writes one `modifier_snapshot` line per distinct state.
@@ -755,7 +886,7 @@ impl KeyboardInjector {
                 target: KEYBOARD_LOG_TARGET,
                 "event=modifier_snapshot session={} observed_flags={:#010x} \
                  observed_source=combined_session_state kinds={} known_sides={} \
-                 expected_sides={} injected_sides={} posted_flags={:#010x}",
+                 expected_sides={} injected_sides={} posted_flags={:#010x} pending_release_sides={}",
                 self.session,
                 state.local_flags,
                 describe_kinds(aggregate),
@@ -763,6 +894,7 @@ impl KeyboardInjector {
                 describe_sides(expected),
                 describe_sides(state.held_sides),
                 state.post_flags,
+                describe_sides(state.pending_release_sides),
             );
         }
     }
@@ -865,7 +997,10 @@ impl KeyboardInjector {
 
         let mut still_held = ModifierSides::default();
         // Same single baseline as `sync_modifiers`, for the same reason.
-        let locally_held = locally_held_flags(state.local_flags, state.remote_flags);
+        let locally_held = locally_held_flags(
+            state.local_flags,
+            state.remote_flags | flags_for(state.pending_release_sides),
+        );
         for (side, next) in transitions(state.held_sides, ModifierSides::default()) {
             let flags = locally_held | flags_for(next);
             let injection = Injection::Modifiers {
@@ -873,6 +1008,8 @@ impl KeyboardInjector {
                 flags,
             };
             if self.release(&mut state, path, injection).is_ok() {
+                state.pending_release_sides = state.pending_release_sides.with(side.bit());
+                state.release_fence_sent = false;
                 state.remote_flags = flags_for(next);
                 state.post_flags = flags;
             } else {
@@ -880,10 +1017,14 @@ impl KeyboardInjector {
             }
         }
         state.held_sides = still_held;
+        // Failed releases remain held; do not retry them as already-released sides.
+        state.pending_release_sides = state.pending_release_sides.without(still_held);
+        state.remote_flags = flags_for(still_held);
+        self.confirm_modifier_releases_in(&mut state);
         self.settle(&mut state);
         CleanupResidue {
             pressed_keys: state.pressed_keys.len(),
-            modifier_sides: state.held_sides,
+            modifier_sides: state.held_sides.with(state.pending_release_sides),
         }
     }
 
@@ -1006,7 +1147,10 @@ impl KeyboardInjector {
         if !state.degraded || state.path != InjectionPath::Nx {
             return;
         }
-        if !state.pressed_keys.is_empty() || !state.held_sides.is_empty() {
+        if !state.pressed_keys.is_empty()
+            || !state.held_sides.is_empty()
+            || !state.pending_release_sides.is_empty()
+        {
             return;
         }
         state.path = InjectionPath::CgEvent;
@@ -1041,7 +1185,7 @@ mod tests {
         NX_DEVICERALTKEYMASK, NX_DEVICERCMDKEYMASK, NX_DEVICERCTLKEYMASK, NX_DEVICERSHIFTKEYMASK,
         NX_SHIFTMASK, desired_sides, flags_for, locally_held_flags,
     };
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
     use std::rc::Rc;
 
@@ -1121,6 +1265,278 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    struct ObservedSink {
+        sink: Rc<FakeSink>,
+        observed: Cell<u32>,
+        apply_fence: Cell<bool>,
+    }
+
+    impl ObservedSink {
+        fn new(observed: u32) -> Rc<Self> {
+            Rc::new(Self {
+                sink: FakeSink::new(InjectionPath::Nx),
+                observed: Cell::new(observed),
+                apply_fence: Cell::new(false),
+            })
+        }
+    }
+
+    impl KeySink for ObservedSink {
+        fn preferred_path(&self) -> InjectionPath {
+            InjectionPath::Nx
+        }
+
+        fn modifier_flags(&self) -> Option<u32> {
+            Some(self.observed.get())
+        }
+
+        fn inject(&self, path: InjectionPath, injection: Injection) -> Result<(), i32> {
+            self.sink.inject(path, injection)?;
+            if self.apply_fence.get() && path == InjectionPath::CgEvent {
+                if let Injection::Modifiers { flags, .. } = injection {
+                    self.observed.set(flags);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn pending_control_release() -> (Rc<ObservedSink>, KeyboardInjector) {
+        let ctrl = flags_for(ModifierSide::LeftControl.bit());
+        let sink = ObservedSink::new(ctrl);
+        let injector = KeyboardInjector::new(sink.clone());
+        assert!(injector.sync_modifiers(
+            ModifierKinds::CONTROL,
+            ModifierSide::LeftControl.bit(),
+            0
+        ));
+        assert!(injector.sync_modifiers(ModifierKinds::default(), ModifierSides::default(), ctrl));
+        (sink, injector)
+    }
+
+    #[test]
+    fn accepted_release_requires_a_fence_and_observed_clear() {
+        let (sink, injector) = pending_control_release();
+        assert_eq!(
+            injector.pending().modifier_sides,
+            ModifierSide::LeftControl.bit()
+        );
+        assert!(!injector.confirm_modifier_releases());
+        // A transient clear cannot retire ownership before older CG events
+        // have a release ordered after them.
+        sink.observed.set(0);
+        assert!(!injector.confirm_modifier_releases());
+        injector.retry_modifier_releases().unwrap();
+        assert_eq!(
+            sink.sink.calls().last(),
+            Some(&(InjectionPath::CgEvent, modifier(LEFT_CONTROL, 0)))
+        );
+        assert!(injector.confirm_modifier_releases());
+        assert!(injector.pending().is_empty());
+    }
+
+    #[test]
+    fn pending_remote_control_cannot_be_reclassified_as_local() {
+        let (sink, injector) = pending_control_release();
+        let ctrl = flags_for(ModifierSide::LeftControl.bit());
+        let shift = flags_for(ModifierSide::RightShift.bit());
+        let unrelated = (1_u64 << 40) | 0x2000_0100;
+        assert!(injector.sync_modifiers(
+            ModifierKinds::default(),
+            ModifierSides::default(),
+            ctrl | shift
+        ));
+        assert_eq!(
+            injector.pointer_event_flags(unrelated | u64::from(ctrl), ctrl | shift),
+            unrelated | u64::from(shift)
+        );
+        sink.observed.set(ctrl | shift);
+        injector.retry_modifier_releases().unwrap();
+        assert_eq!(
+            sink.sink.calls().last(),
+            Some(&(InjectionPath::CgEvent, modifier(LEFT_CONTROL, shift)))
+        );
+        assert!(!injector.confirm_modifier_releases());
+        sink.observed.set(shift);
+        assert!(injector.confirm_modifier_releases());
+    }
+
+    #[test]
+    fn pointer_events_use_current_remote_and_fresh_local_modifiers() {
+        let sink = ObservedSink::new(0);
+        let injector = KeyboardInjector::new(sink);
+        let ctrl = flags_for(ModifierSide::LeftControl.bit());
+        let shift = flags_for(ModifierSide::LeftShift.bit());
+        injector.sync_modifiers(ModifierKinds::CONTROL, ModifierSide::LeftControl.bit(), 0);
+        assert_eq!(
+            injector.pointer_event_flags(0, shift),
+            u64::from(ctrl | shift)
+        );
+        let sink = FakeSink::new(InjectionPath::Nx);
+        let idle = KeyboardInjector::new(sink);
+        assert_eq!(
+            idle.pointer_event_flags(u64::from(ctrl), shift),
+            u64::from(shift)
+        );
+        assert_eq!(idle.pointer_event_flags(0, ctrl), u64::from(ctrl));
+    }
+
+    #[test]
+    fn local_opposite_control_keeps_its_aggregate_flag() {
+        let (sink, injector) = pending_control_release();
+        let right = flags_for(ModifierSide::RightControl.bit());
+        let both = right | NX_DEVICELCTLKEYMASK;
+        sink.observed.set(both);
+        assert_eq!(
+            injector.pointer_event_flags(u64::from(both), both),
+            u64::from(right)
+        );
+        injector.retry_modifier_releases().unwrap();
+        assert_eq!(
+            sink.sink.calls().last(),
+            Some(&(InjectionPath::CgEvent, modifier(LEFT_CONTROL, right)))
+        );
+        sink.observed.set(right);
+        assert!(injector.confirm_modifier_releases());
+    }
+
+    #[test]
+    fn releasing_one_remote_side_does_not_release_its_held_sibling() {
+        let both = sides(&[ModifierSide::LeftControl, ModifierSide::RightControl]);
+        let sink = ObservedSink::new(flags_for(both));
+        let injector = KeyboardInjector::new(sink.clone());
+        injector.sync_modifiers(ModifierKinds::CONTROL, both, 0);
+        injector.sync_modifiers(
+            ModifierKinds::CONTROL,
+            ModifierSide::RightControl.bit(),
+            flags_for(both),
+        );
+        injector.retry_modifier_releases().unwrap();
+        let right = flags_for(ModifierSide::RightControl.bit());
+        assert_eq!(
+            sink.sink.calls().last(),
+            Some(&(InjectionPath::CgEvent, modifier(LEFT_CONTROL, right)))
+        );
+        sink.observed.set(right);
+        assert!(injector.confirm_modifier_releases());
+        assert_eq!(
+            injector.pending().modifier_sides,
+            ModifierSide::RightControl.bit()
+        );
+    }
+
+    #[test]
+    fn a_repress_cancels_the_previous_release_obligation() {
+        let (sink, injector) = pending_control_release();
+        injector.sync_modifiers(
+            ModifierKinds::CONTROL,
+            ModifierSide::LeftControl.bit(),
+            sink.observed.get(),
+        );
+        let count = sink.sink.calls().len();
+        injector.retry_modifier_releases().unwrap();
+        assert_eq!(sink.sink.calls().len(), count);
+        assert!(injector.confirm_modifier_releases());
+        assert_eq!(
+            injector.pending().modifier_sides,
+            ModifierSide::LeftControl.bit()
+        );
+    }
+
+    #[test]
+    fn an_aggregate_only_residue_is_not_confirmed_clear() {
+        let (sink, injector) = pending_control_release();
+        injector.retry_modifier_releases().unwrap();
+        sink.observed.set(NX_CONTROLMASK);
+        assert!(!injector.confirm_modifier_releases());
+        sink.observed.set(0);
+        assert!(injector.confirm_modifier_releases());
+    }
+
+    #[tokio::test]
+    async fn idle_release_waits_for_native_confirmation_without_more_input() {
+        let (sink, injector) = pending_control_release();
+        sink.apply_fence.set(true);
+        assert!(injector.wait_modifier_releases().await.unwrap());
+        assert_eq!(sink.observed.get(), 0);
+        assert!(injector.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chord_cleanup_confirms_every_released_side_and_preserves_local_control() {
+        let remote = sides(&[
+            ModifierSide::LeftControl,
+            ModifierSide::LeftShift,
+            ModifierSide::LeftOption,
+            ModifierSide::LeftCommand,
+        ]);
+        let local = flags_for(ModifierSide::RightControl.bit());
+        let sink = ObservedSink::new(local);
+        let injector = KeyboardInjector::new(sink.clone());
+        assert!(
+            injector.sync_modifiers(
+                ModifierKinds::CONTROL
+                    .with(ModifierKinds::SHIFT)
+                    .with(ModifierKinds::OPTION)
+                    .with(ModifierKinds::COMMAND),
+                remote,
+                local,
+            )
+        );
+        sink.observed.set(flags_for(remote) | local);
+        assert_eq!(injector.release_all().modifier_sides, remote);
+        let before_retry = sink.sink.calls().len();
+        sink.apply_fence.set(true);
+        assert!(injector.wait_modifier_releases().await.unwrap());
+        assert!(injector.pending().is_empty());
+        assert_eq!(sink.observed.get(), local);
+        let retries = sink.sink.calls();
+        assert_eq!(retries.len() - before_retry, 8);
+        for (_, injection) in &retries[before_retry..] {
+            let Injection::Modifiers { key_code, flags } = injection else {
+                panic!("modifier cleanup must not replay ordinary keys");
+            };
+            assert!(remote.contains(ModifierSide::from_key_code(*key_code).unwrap().bit()));
+            assert_eq!(*flags, local);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_timeout_retains_residue_for_later_cleanup() {
+        let (sink, injector) = pending_control_release();
+        assert!(!injector.wait_modifier_releases().await.unwrap());
+        assert!(!injector.release_all().is_empty());
+        sink.apply_fence.set(true);
+        assert!(injector.wait_modifier_releases().await.unwrap());
+        assert!(injector.release_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_fence_retains_ownership_until_retry_succeeds() {
+        let (sink, injector) = pending_control_release();
+        sink.sink.fail_once(InjectionPath::CgEvent);
+        assert!(injector.wait_modifier_releases().await.is_err());
+        assert!(!injector.pending().is_empty());
+        sink.apply_fence.set(true);
+        assert!(injector.wait_modifier_releases().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelled_release_barrier_does_not_discard_ownership() {
+        let (sink, injector) = pending_control_release();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                injector.wait_modifier_releases()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!injector.pending().is_empty());
+        sink.apply_fence.set(true);
+        assert!(injector.wait_modifier_releases().await.unwrap());
     }
 
     fn sides(list: &[ModifierSide]) -> ModifierSides {
@@ -1672,6 +2088,8 @@ mod tests {
             path: InjectionPath::Nx,
             held_sides: sides(&[ModifierSide::LeftControl]),
             remote_flags: NX_CONTROLMASK | NX_DEVICELCTLKEYMASK,
+            pending_release_sides: ModifierSides::default(),
+            release_fence_sent: false,
             post_flags: NX_CONTROLMASK | NX_DEVICELCTLKEYMASK,
             local_flags: 0,
             pressed_keys: BTreeSet::new(),
@@ -1712,6 +2130,8 @@ mod tests {
                 path: InjectionPath::Nx,
                 held_sides: ModifierSides::default(),
                 remote_flags: 0,
+                pending_release_sides: ModifierSides::default(),
+                release_fence_sent: false,
                 post_flags: 0,
                 local_flags: 0,
                 pressed_keys: BTreeSet::new(),

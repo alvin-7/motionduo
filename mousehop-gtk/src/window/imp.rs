@@ -9,7 +9,7 @@ use gtk::{
     Label, ListBox, PropagationPhase, Scale, ScrolledWindow, Switch, gdk, gio, glib,
 };
 
-use mousehop_ipc::{DEFAULT_PORT, FrontendRequestWriter};
+use mousehop_ipc::DEFAULT_PORT;
 
 use crate::authorization_window::AuthorizationWindow;
 use crate::clipboard_privacy_window::ClipboardPrivacyWindow;
@@ -80,7 +80,7 @@ pub struct Window {
     pub about_copy_button: TemplateChild<Button>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
-    pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,
+    pub(super) frontend_request_writer: RefCell<Option<crate::frontend_writer::FrontendWriter>>,
     pub port: Cell<u16>,
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,

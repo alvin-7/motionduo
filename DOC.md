@@ -101,6 +101,32 @@ The dispatcher component takes events from the event receiver and passes them
 to the correct backend corresponding to the type of client.
 
 
+## Network refresh and GUI responsiveness
+
+Network discovery and network-lock fingerprinting share one interface snapshot
+per refresh. Blocking OS interface/gateway queries run on a bounded blocking
+worker, never on the input executor. Refresh requests coalesce while a query is
+running; the service continues dispatching input and IPC until a result arrives.
+Unchanged snapshots do not re-register mDNS. Network-policy changes wait for a
+fresh result in a bounded queue, rather than blocking input or using an old
+network fingerprint. Failed queries retain the last snapshot and reject pending
+policy changes, leaving persisted locks untouched.
+
+Listener enumeration also runs off the input executor. Failed enumeration does
+not remove existing listeners, and interface events invalidate snapshots started
+before those events, so an old result cannot remove a newly added listener.
+
+The GTK frontend writes daemon requests on a dedicated thread through a bounded
+FIFO (64 requests). A full queue reports an error rather than blocking the UI or
+silently dropping a change. The writer uses
+`FrontendRequestWriter::set_write_timeout(Some(Duration::from_secs(1)))`.
+A failed/partial write shuts down that IPC stream so the existing reader can
+trigger reconnect and resynchronization; queued commands from the old writer are
+not replayed. On macOS, closing the main window still hides it rather than
+quitting. Activation-policy updates are deferred out of GTK visibility callbacks.
+These changes remove blocking/reentrant risks; intermittent native close failures
+still require target-machine UI validation.
+
 ## Network transport
 
 Peer events and control messages use authenticated DTLS connections over UDP.

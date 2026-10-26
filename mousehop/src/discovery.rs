@@ -25,19 +25,14 @@
 //! all browse/registration state — useful on networks where mDNS
 //! multicast (224.0.0.251) is firewalled.
 
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::HashMap, net::IpAddr, rc::Rc};
 
 use local_channel::mpsc::Sender;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use mousehop_ipc::IfaceKind;
 use tokio::task::{JoinHandle, spawn_local};
 
-use crate::network::{default_interface_kind, is_routable_ip, local_addresses_with_kind};
+use crate::network::{NetworkSnapshot, is_routable_ip};
 
 const SERVICE_TYPE: &str = "_mousehop._udp.local.";
 const TXT_PRIMARY_KEY: &str = "primary";
@@ -79,18 +74,6 @@ fn parse_iface_kind(s: &str) -> Option<IfaceKind> {
         "other" => Some(IfaceKind::Other),
         _ => None,
     }
-}
-
-/// Cross-platform: IP of the interface that owns the default route.
-///
-/// On macOS the default route reflects the user's service-order
-/// ranking — that's exactly the "primary" the user expects when they
-/// say "use Ethernet, not Wi-Fi". On Linux it reflects the lowest-
-/// metric default route. On Windows it's whatever
-/// `GetBestRoute2` selects.
-fn primary_ipv4() -> Option<Ipv4Addr> {
-    let iface = netdev::get_default_interface().ok()?;
-    iface.ipv4.first().map(|net| net.addr())
 }
 
 fn local_hostname() -> String {
@@ -186,6 +169,7 @@ pub(crate) struct Discovery {
     /// Sink for [`DiscoveryEvent`]s, drained by the service. Held so a
     /// re-enable (`set_enabled`) hands the fresh browse task a clone.
     event_tx: Sender<DiscoveryEvent>,
+    network: NetworkSnapshot,
 }
 
 impl Discovery {
@@ -201,10 +185,11 @@ impl Discovery {
         enabled: bool,
         primary_cache: PrimaryCache,
         event_tx: Sender<DiscoveryEvent>,
+        network: NetworkSnapshot,
     ) -> Self {
         if !enabled {
             log::info!("mdns discovery disabled by config");
-            return Self::inert(port, primary_cache, event_tx);
+            return Self::inert(port, primary_cache, event_tx, network);
         }
         match ServiceDaemon::new() {
             Ok(daemon) => {
@@ -216,18 +201,24 @@ impl Discovery {
                     browse_task,
                     port,
                     event_tx,
+                    network,
                 };
                 this.register();
                 this
             }
             Err(e) => {
                 log::warn!("mdns ServiceDaemon::new failed: {e}; discovery disabled");
-                Self::inert(port, primary_cache, event_tx)
+                Self::inert(port, primary_cache, event_tx, network)
             }
         }
     }
 
-    fn inert(port: u16, primary_cache: PrimaryCache, event_tx: Sender<DiscoveryEvent>) -> Self {
+    fn inert(
+        port: u16,
+        primary_cache: PrimaryCache,
+        event_tx: Sender<DiscoveryEvent>,
+        network: NetworkSnapshot,
+    ) -> Self {
         Self {
             daemon: None,
             registered_fullname: None,
@@ -235,6 +226,7 @@ impl Discovery {
             browse_task: None,
             port,
             event_tx,
+            network,
         }
     }
 
@@ -245,16 +237,14 @@ impl Discovery {
         let Some(daemon) = self.daemon.as_ref() else {
             return;
         };
-        // Drop the old registration first so we don't leave stale
-        // TXT records floating on the network.
-        if let Some(old) = self.registered_fullname.take() {
-            let _ = daemon.unregister(&old);
-        }
         let host = local_hostname();
         let host_record = format!("{host}.local.");
-        let primary = match primary_ipv4() {
+        let primary = match self.network.primary {
             Some(ip) => ip,
             None => {
+                if let Some(old) = self.registered_fullname.take() {
+                    let _ = daemon.unregister(&old);
+                }
                 log::warn!(
                     "mdns: no default-route interface; skipping registration (will retry on \
                      interface change)"
@@ -265,21 +255,11 @@ impl Discovery {
         // Advertise *every* physical-interface address (so a dual-homed
         // peer surfaces all of them via discovery, no hand-pinning),
         // each tagged with its interface kind in a `if_<ip>` TXT key.
-        let (mut addresses, mut kinds) = local_addresses_with_kind();
-        if !addresses.contains(&IpAddr::V4(primary)) {
-            addresses.push(IpAddr::V4(primary));
-        }
-        // The primary may live on an interface `local_addresses_with_kind`
-        // filtered out (e.g. a VPN tunnel routing the default), so it
-        // wouldn't otherwise get an `if_<ip>` label. Tag it with the
-        // default interface's kind (Other if unknown) so every
-        // advertised address is labeled.
-        kinds
-            .entry(IpAddr::V4(primary))
-            .or_insert_with(|| default_interface_kind().unwrap_or(IfaceKind::Other));
+        let addresses = &self.network.addresses;
+        let kinds = &self.network.kinds;
         let mut props = HashMap::new();
         props.insert(TXT_PRIMARY_KEY.to_string(), primary.to_string());
-        for (ip, kind) in &kinds {
+        for (ip, kind) in kinds {
             props.insert(
                 format!("{TXT_IFACE_PREFIX}{ip}"),
                 iface_kind_str(*kind).to_string(),
@@ -300,6 +280,9 @@ impl Discovery {
             }
         };
         let fullname = info.get_fullname().to_string();
+        if let Some(old) = self.registered_fullname.take() {
+            let _ = daemon.unregister(&old);
+        }
         match daemon.register(info) {
             Ok(()) => {
                 log::info!(
@@ -316,8 +299,10 @@ impl Discovery {
     /// by the service's main loop so the TXT record reflects the
     /// active default-route interface even when interface changes
     /// don't arrive through if-watch.
-    pub(crate) fn refresh(&mut self) {
-        if self.daemon.is_some() {
+    pub(crate) fn refresh(&mut self, network: NetworkSnapshot) {
+        let changed = self.network != network;
+        self.network = network;
+        if self.daemon.is_some() && (changed || self.registered_fullname.is_none()) {
             self.register();
         }
     }
@@ -328,7 +313,7 @@ impl Discovery {
             return;
         }
         self.port = port;
-        self.refresh();
+        self.register();
     }
 
     /// Toggle the subsystem on/off. Off → unregister, abort browse,
@@ -345,6 +330,7 @@ impl Discovery {
                 true,
                 self.primary_cache.clone(),
                 self.event_tx.clone(),
+                self.network.clone(),
             );
         } else {
             self.shutdown();

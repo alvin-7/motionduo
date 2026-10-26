@@ -29,7 +29,7 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::{connect::handshake_allows_event, crypto};
+use crate::{connect::handshake_allows_event, crypto, network::BackgroundRefresh};
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -241,7 +241,11 @@ impl MousehopListener {
         // Per-IP binds make replies symmetric automatically: each
         // listener's reply socket is bound to a specific IP, so the
         // kernel uses *that* IP as source.
-        let initial_addrs = enumerate_listenable_addrs();
+        let initial_addrs = tokio::task::spawn_blocking(enumerate_listenable_addrs)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         if initial_addrs.is_empty() {
             // Fall back to 0.0.0.0 so we at least listen somewhere if
             // interface enumeration fails (very unusual).
@@ -479,22 +483,16 @@ fn is_listenable_addr(ip: IpAddr) -> bool {
 /// Returns both IPv4 and IPv6 addresses; `is_listenable_addr` drops
 /// the ones a remote peer cannot reach (loopback, link-local,
 /// unspecified, multicast).
-fn enumerate_listenable_addrs() -> Vec<IpAddr> {
-    let ifaces = match if_addrs::get_if_addrs() {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("get_if_addrs failed: {e}");
-            return Vec::new();
-        }
-    };
-    ifaces
+fn enumerate_listenable_addrs() -> std::io::Result<Vec<IpAddr>> {
+    let ifaces = if_addrs::get_if_addrs()?;
+    Ok(ifaces
         .into_iter()
         .map(|iface| match iface.addr {
             if_addrs::IfAddr::V4(v4) => IpAddr::V4(v4.ip),
             if_addrs::IfAddr::V6(v6) => IpAddr::V6(v6.ip),
         })
         .filter(|ip| is_listenable_addr(*ip))
-        .collect()
+        .collect())
 }
 
 async fn try_bind_listener(
@@ -645,11 +643,31 @@ fn spawn_supervisor_task(
         // Skip the immediate-first tick — we just enumerated at startup
         // and don't want to thrash listeners on the first iteration.
         reconcile_tick.tick().await;
+        let mut refresh = BackgroundRefresh::new();
+        let mut interface_revision = 0u64;
         loop {
             tokio::select! {
                 _ = reconcile_tick.tick() => {
+                    let revision = interface_revision;
+                    refresh.request(move || (revision, enumerate_listenable_addrs()));
+                }
+                result = refresh.event() => {
+                    let addrs = match result {
+                        Ok((revision, _)) if revision != interface_revision => {
+                            // An Up/Down event superseded this slow snapshot.
+                            // Never remove a newly bound listener using old IPs.
+                            let revision = interface_revision;
+                            refresh.request(move || (revision, enumerate_listenable_addrs()));
+                            continue;
+                        }
+                        Ok((_, Ok(addrs))) => addrs,
+                        result => {
+                            log::warn!("listener enumeration failed; retaining listeners: {result:?}");
+                            continue;
+                        }
+                    };
                     let current_ips: HashSet<IpAddr> =
-                        enumerate_listenable_addrs().into_iter().collect();
+                        addrs.into_iter().collect();
                     let to_drop: Vec<IpAddr> = listeners
                         .keys()
                         .filter(|ip| !current_ips.contains(*ip))
@@ -706,6 +724,7 @@ fn spawn_supervisor_task(
                     }
                 } => match ev {
                     Ok(if_watch::IfEvent::Up(net)) => {
+                        interface_revision = interface_revision.wrapping_add(1);
                         let ip = net.addr();
                         if is_listenable_addr(ip) && !listeners.contains_key(&ip) {
                             match try_bind_listener(ip, port, &cfg).await {
@@ -726,6 +745,7 @@ fn spawn_supervisor_task(
                         }
                     }
                     Ok(if_watch::IfEvent::Down(net)) => {
+                        interface_revision = interface_revision.wrapping_add(1);
                         let ip = net.addr();
                         close_reliable_connections(&conns, Some(ip)).await;
                         if listeners.remove(&ip).is_some() {
@@ -773,10 +793,26 @@ fn spawn_supervisor_task(
                 }
                 p = request_port_change_rx.recv() => {
                     let new_port = p.expect("channel closed");
+                    let revision = interface_revision;
+                    refresh.request(move || (revision, enumerate_listenable_addrs()));
+                    let mut result = refresh.event().await;
+                    if matches!(&result, Ok((revision, _)) if *revision != interface_revision) {
+                        let revision = interface_revision;
+                        refresh.request(move || (revision, enumerate_listenable_addrs()));
+                        result = refresh.event().await;
+                    }
+                    let addrs = match result {
+                        Ok((_, Ok(addrs))) => addrs,
+                        result => {
+                            log::warn!("port change: enumeration failed; retaining listeners: {result:?}");
+                            port_changed_tx.send(Err(ListenerCreationError::NoBoundListener))
+                                .expect("channel closed");
+                            continue;
+                        }
+                    };
                     close_reliable_connections(&conns, None).await;
                     listeners.clear(); // Drop aborts each accept task
                     let mut bound = 0usize;
-                    let addrs = enumerate_listenable_addrs();
                     for ip in &addrs {
                         match try_bind_listener(*ip, new_port, &cfg).await {
                             Ok(l) => {

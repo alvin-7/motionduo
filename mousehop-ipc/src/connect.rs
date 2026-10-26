@@ -43,11 +43,24 @@ impl FrontendEventReader {
 }
 
 impl FrontendRequestWriter {
+    /// Bound blocking writes for callers using a dedicated writer thread.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.line_writer.get_ref().set_write_timeout(timeout)
+    }
+
     pub fn request(&mut self, request: FrontendRequest) -> Result<(), io::Error> {
         let mut json = serde_json::to_string(&request).unwrap();
         log::debug!("requesting: {json}");
         json.push('\n');
-        self.line_writer.write_all(json.as_bytes())?;
+        if let Err(error) = self.line_writer.write_all(json.as_bytes()) {
+            // A partial JSON frame cannot be retried on the same stream.
+            // Wake the reader too, so frontends can reconnect and resync.
+            let _ = self
+                .line_writer
+                .get_ref()
+                .shutdown(std::net::Shutdown::Both);
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -145,6 +158,45 @@ mod tests {
     use super::*;
     use std::io::ErrorKind;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn blocked_write_times_out_and_disconnects_partial_frame() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mut reader = client.try_clone().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut writer = FrontendRequestWriter {
+            line_writer: LineWriter::new(client),
+        };
+        writer
+            .set_write_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
+        let error = writer
+            .request(FrontendRequest::AuthorizeKey(
+                "x".repeat(4 * 1024 * 1024),
+                String::new(),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+        assert_eq!(
+            reader.read(&mut [0]).unwrap(),
+            0,
+            "reader must wake for reconnect"
+        );
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut partial = Vec::new();
+        server.read_to_end(&mut partial).unwrap();
+        assert!(
+            !partial.ends_with(b"\n"),
+            "failed frame must never look complete"
+        );
+    }
 
     #[test]
     fn one_shot_connect_returns_when_socket_is_missing() {

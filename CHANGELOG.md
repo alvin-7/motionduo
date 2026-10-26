@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.18] - 2026-10-26
+
+### Fixed
+
+- Move blocking interface and gateway discovery off the input executor. Share
+  snapshots between network locks and mDNS, coalesce refreshes, and avoid
+  re-registering unchanged advertisements without extending KCP timeouts.
+- Preserve listeners on enumeration failure and discard snapshots superseded by
+  interface events. Defer network-policy changes until a fresh query completes.
+- Move GTK daemon request writes to a bounded background FIFO, report queue
+  saturation, and disconnect partial writes so the frontend can reconnect.
+- Defer macOS activation-policy updates out of window visibility callbacks and
+  add close/visibility diagnostics. Closing still hides the window, not quits.
+
+### Validation
+
+- Windows: 314 workspace tests passed; macOS Apple Silicon: 354 passed. Both
+  platforms passed Clippy and the real interface-query scheduling probe.
+- One network-environment-sensitive latency test was explicitly filtered on each
+  platform; other ignored tests are documented in the repair report.
+- Long-running wired dual-machine input and the intermittent local-trackpad
+  close-button failure still require live acceptance. The GUI changes harden
+  identified risks; the intermittent close failure's root cause is unconfirmed.
+
 ## [0.17.17] - 2026-10-20
 
 ### Fixed

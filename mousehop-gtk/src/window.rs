@@ -48,7 +48,7 @@ impl Window {
             .imp()
             .frontend_request_writer
             .borrow_mut()
-            .replace(conn);
+            .replace(crate::frontend_writer::FrontendWriter::new(conn).expect("create IPC writer"));
         window
     }
 
@@ -793,10 +793,16 @@ impl Window {
     }
 
     fn request(&self, request: FrontendRequest) {
-        let mut requester = self.imp().frontend_request_writer.borrow_mut();
-        let requester = requester.as_mut().unwrap();
-        if let Err(e) = requester.request(request) {
+        let result = self
+            .imp()
+            .frontend_request_writer
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .request(request);
+        if let Err(e) = result {
             log::error!("error sending message: {e}");
+            self.show_toast(&e.to_string());
         };
     }
 
@@ -808,7 +814,7 @@ impl Window {
         self.imp()
             .frontend_request_writer
             .borrow_mut()
-            .replace(conn);
+            .replace(crate::frontend_writer::FrontendWriter::new(conn).expect("create IPC writer"));
         self.request(FrontendRequest::Sync);
     }
 

@@ -3,6 +3,7 @@ mod client_object;
 mod client_row;
 mod clipboard_privacy_window;
 mod fingerprint_window;
+mod frontend_writer;
 mod glyph_font;
 mod key_object;
 mod key_row;
@@ -508,6 +509,7 @@ fn build_ui(app: &Application) {
     #[cfg(target_os = "macos")]
     {
         window.connect_close_request(|window| {
+            log::info!("Mac main-window close requested; hiding window");
             window.set_visible(false);
             glib::Propagation::Stop
         });
@@ -516,13 +518,22 @@ fn build_ui(app: &Application) {
         // user has a familiar way back to the app), Accessory while
         // the window is hidden and only the menu-bar item is around
         // (matches the LSUIElement-style background-helper feel).
-        window.connect_show(|_| {
-            macos_status_item::set_activation_policy(macos_status_item::ACTIVATION_POLICY_REGULAR);
-        });
-        window.connect_hide(|_| {
-            macos_status_item::set_activation_policy(
-                macos_status_item::ACTIVATION_POLICY_ACCESSORY,
-            );
+        // Do not change NSApplication policy in the middle of GTK's native
+        // show/hide callback. Read the final visibility on the next
+        // main-loop turn, including a quick close followed by re-open.
+        window.connect_visible_notify(|window| {
+            let window = window.downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(window) = window.upgrade() {
+                    let policy = if window.is_visible() {
+                        macos_status_item::ACTIVATION_POLICY_REGULAR
+                    } else {
+                        macos_status_item::ACTIVATION_POLICY_ACCESSORY
+                    };
+                    macos_status_item::set_activation_policy(policy);
+                    log::info!("Mac main-window visible={}", window.is_visible());
+                }
+            });
         });
         macos_status_item::setup(app, &window);
         // First-launch TCC prompts. No-op when already granted.

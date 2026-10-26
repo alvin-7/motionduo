@@ -9,7 +9,7 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     latency::{LatencyProber, ProbeResult},
     listen::{ListenerCreationError, ListenerSession, MousehopListener},
-    network::current_network_id,
+    network::{BackgroundRefresh, NetworkSnapshot},
 };
 use futures::StreamExt;
 use input_capture::clipboard::{ClipboardMonitor, SuppressionList};
@@ -119,6 +119,8 @@ pub struct Service {
     /// lock resolution; recomputed periodically and on interface
     /// changes. `None` when undeterminable (locks then don't apply).
     current_network: Option<String>,
+    network_refresh: BackgroundRefresh<Result<NetworkSnapshot, &'static str>>,
+    pending_network_requests: VecDeque<FrontendRequest>,
     /// Outgoing connection handle to fan clipboard frames out from
     /// the capture / forwarding paths. Same handle Capture owns;
     /// cloned in `Service::new` so Service can call `send` directly
@@ -267,16 +269,26 @@ impl Service {
 
         let port = config.port();
         let (discovery_event_tx, discovery_event_rx) = channel();
+        let mut network_refresh = BackgroundRefresh::new();
+        network_refresh.request(NetworkSnapshot::query);
+        let network = match network_refresh.event().await {
+            Ok(Ok(network)) => network,
+            result => {
+                log::warn!("initial network query failed: {result:?}");
+                NetworkSnapshot::default()
+            }
+        };
+        let current_network = network.network_id.clone();
         let discovery = Discovery::new(
             port,
             config.mdns_discovery(),
             primary_cache.clone(),
             discovery_event_tx,
+            network,
         );
         // Resolve the lock (if any) for the network we boot on, before
         // the first dial, so a locked client connects on the right
         // interface immediately.
-        let current_network = current_network_id();
         for handle in client_manager.registered_clients() {
             client_manager.recompute_active_lock(handle, current_network.as_deref());
         }
@@ -327,6 +339,8 @@ impl Service {
             discovery,
             discovery_event_rx,
             current_network,
+            network_refresh,
+            pending_network_requests: VecDeque::new(),
             conn: conn_for_service,
             clipboard_monitor,
             recent_forwarded: HashMap::new(),
@@ -352,9 +366,9 @@ impl Service {
         // Periodic refresh of the Discovery service registration so
         // its TXT record stays accurate when the OS-preferred
         // interface (default route) changes — e.g. user switches
-        // off Wi-Fi and Mac falls back to Ethernet. Cheap: at most
-        // one re-publish every 30s, and a no-op when the primary
-        // hasn't moved. `Skip` so a long suspend doesn't backlog-
+        // off Wi-Fi and Mac falls back to Ethernet. OS enumeration runs
+        // on one blocking worker; unchanged snapshots aren't re-published.
+        // `Skip` so a long suspend doesn't backlog-
         // burst on resume.
         let mut discovery_refresh_tick = tokio::time::interval(Duration::from_secs(30));
         discovery_refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -374,7 +388,8 @@ impl Service {
                     self.handle_discovery_event(event)
                 }
                 _ = self.config.changed() => self.handle_config_change().await,
-                _ = discovery_refresh_tick.tick() => self.on_discovery_refresh().await,
+                _ = discovery_refresh_tick.tick() => self.network_refresh.request(NetworkSnapshot::query),
+                result = self.network_refresh.event() => self.on_network_snapshot(result).await,
                 event = recv_clipboard(&mut self.clipboard_monitor) => {
                     self.handle_local_clipboard_event(event).await;
                 }
@@ -570,40 +585,16 @@ impl Service {
                     self.save_config().await;
                 }
             }
-            FrontendRequest::SetConnectionMode(handle, mode) => {
-                // Resolve the live network first: the user is acting on a
-                // connected machine, so a stale cached `None` (from a
-                // transient blip) must not leave this network's lock in
-                // place to silently re-activate later.
-                self.refresh_network().await;
-                let net = self.current_network.clone();
-                if self.client_manager.set_mode(handle, mode, net.as_deref()) {
-                    // The mode change may have cleared this network's
-                    // lock; re-resolve and re-dial so the new policy
-                    // takes effect immediately.
-                    self.client_manager
-                        .recompute_active_lock(handle, net.as_deref());
-                    self.conn.reset_handle(handle).await;
-                    self.broadcast_client(handle);
-                    self.save_config().await;
-                }
-            }
-            FrontendRequest::SetNetworkLock(handle, ip) => {
-                // Resolve the live network first (see SetConnectionMode).
-                self.refresh_network().await;
-                let Some(net) = self.current_network.clone() else {
-                    log::warn!("cannot lock client {handle}: current network unknown");
-                    return;
-                };
-                if self.client_manager.set_network_lock(handle, &net, ip) {
-                    self.client_manager
-                        .recompute_active_lock(handle, Some(&net));
-                    // Drop any live connection so the lock takes effect
-                    // on the next event instead of waiting for the
-                    // current (possibly wrong-interface) path to drop.
-                    self.conn.reset_handle(handle).await;
-                    self.broadcast_client(handle);
-                    self.save_config().await;
+            request @ (FrontendRequest::SetConnectionMode(..)
+            | FrontendRequest::SetNetworkLock(..)) => {
+                // Wait for a fresh fingerprint without parking input dispatch.
+                if self.pending_network_requests.len() < 32 {
+                    self.pending_network_requests.push_back(request);
+                    self.network_refresh.request(NetworkSnapshot::query);
+                } else {
+                    self.notify_frontend(FrontendEvent::Error(
+                        "network query busy; retry the change".into(),
+                    ));
                 }
             }
             FrontendRequest::SetIncomingPeerClipboardReceive(fp, enabled) => {
@@ -1211,19 +1202,70 @@ impl Service {
         }
     }
 
-    /// Periodic discovery housekeeping: re-publish our advertisement
-    /// (primary interface may have changed) and re-evaluate which
-    /// network we're on for per-network lock resolution.
-    async fn on_discovery_refresh(&mut self) {
-        self.discovery.refresh();
-        self.refresh_network().await;
+    async fn on_network_snapshot(
+        &mut self,
+        result: Result<Result<NetworkSnapshot, &'static str>, tokio::task::JoinError>,
+    ) {
+        let network = match result {
+            Ok(Ok(network)) => network,
+            result => {
+                log::warn!("network query failed; retaining last snapshot: {result:?}");
+                if !self.pending_network_requests.is_empty() {
+                    self.pending_network_requests.clear();
+                    self.notify_frontend(FrontendEvent::Error(
+                        "network query failed; retry the change".into(),
+                    ));
+                }
+                return;
+            }
+        };
+        let net = network.network_id.clone();
+        self.discovery.refresh(network);
+        self.refresh_network(net).await;
+        while let Some(request) = self.pending_network_requests.pop_front() {
+            self.apply_network_request(request).await;
+        }
+    }
+
+    async fn apply_network_request(&mut self, request: FrontendRequest) {
+        match request {
+            FrontendRequest::SetConnectionMode(handle, mode) => {
+                let net = self.current_network.clone();
+                if self.client_manager.set_mode(handle, mode, net.as_deref()) {
+                    // The mode change may have cleared this network's
+                    // lock; re-resolve and re-dial so the new policy
+                    // takes effect immediately.
+                    self.client_manager
+                        .recompute_active_lock(handle, net.as_deref());
+                    self.conn.reset_handle(handle).await;
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
+            FrontendRequest::SetNetworkLock(handle, ip) => {
+                let Some(net) = self.current_network.clone() else {
+                    log::warn!("cannot lock client {handle}: current network unknown");
+                    return;
+                };
+                if self.client_manager.set_network_lock(handle, &net, ip) {
+                    self.client_manager
+                        .recompute_active_lock(handle, Some(&net));
+                    // Drop any live connection so the lock takes effect
+                    // on the next event instead of waiting for the
+                    // current (possibly wrong-interface) path to drop.
+                    self.conn.reset_handle(handle).await;
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
+            _ => unreachable!("only network policy requests are deferred"),
+        }
     }
 
     /// Recompute the current-network fingerprint. On change, re-resolve
     /// every client's active lock and re-dial those whose lock moved so
     /// the new network's pin (or its absence) takes effect at once.
-    async fn refresh_network(&mut self) {
-        let net = current_network_id();
+    async fn refresh_network(&mut self, net: Option<String>) {
         if net == self.current_network {
             return;
         }

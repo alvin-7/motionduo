@@ -157,6 +157,17 @@ const FASTEST_UPGRADE_STREAK: u8 = 3;
 
 const RECENT_FORWARD_TTL: Duration = Duration::from_secs(1);
 
+fn discard_network_requests_for_client(
+    requests: &mut VecDeque<FrontendRequest>,
+    removed: ClientHandle,
+) {
+    requests.retain(|request| {
+        !matches!(request,
+            FrontendRequest::SetConnectionMode(handle, _) | FrontendRequest::SetNetworkLock(handle, _)
+                if *handle == removed)
+    });
+}
+
 fn clipboard_hash(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
@@ -585,8 +596,12 @@ impl Service {
                     self.save_config().await;
                 }
             }
-            request @ (FrontendRequest::SetConnectionMode(..)
-            | FrontendRequest::SetNetworkLock(..)) => {
+            request @ (FrontendRequest::SetConnectionMode(handle, _)
+            | FrontendRequest::SetNetworkLock(handle, _)) => {
+                if self.client_manager.get_state(handle).is_none() {
+                    self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+                    return;
+                }
                 // Wait for a fresh fingerprint without parking input dispatch.
                 if self.pending_network_requests.len() < 32 {
                     self.pending_network_requests.push_back(request);
@@ -1506,6 +1521,9 @@ impl Service {
     }
 
     async fn remove_client(&mut self, handle: ClientHandle) {
+        // A slow query must not carry old policy into a reused Slab handle,
+        // including clients rebuilt during a configuration reload.
+        discard_network_requests_for_client(&mut self.pending_network_requests, handle);
         // Retire the exact outbound DTLS generation before Slab can reuse this
         // numeric handle for a different configured peer. The remote side
         // releases its emulation handle on connection close, and Capture gets
@@ -1617,6 +1635,29 @@ async fn recv_discovery(rx: &mut Receiver<DiscoveryEvent>) -> DiscoveryEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleted_client_cannot_transfer_queued_policy_to_reused_handle() {
+        let clients = ClientManager::default();
+        let removed = clients.add_client();
+        let other = clients.add_client();
+        let mut requests = VecDeque::from([
+            FrontendRequest::SetNetworkLock(removed, "192.0.2.1".parse().unwrap()),
+            FrontendRequest::SetConnectionMode(other, ConnectionMode::default()),
+            FrontendRequest::SetConnectionMode(removed, ConnectionMode::default()),
+        ]);
+        discard_network_requests_for_client(&mut requests, removed);
+        clients.remove_client(removed);
+        assert_eq!(
+            clients.add_client(),
+            removed,
+            "exercise actual handle reuse"
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(requests.front(), Some(FrontendRequest::SetConnectionMode(handle, _)) if *handle == other)
+        );
+    }
 
     #[test]
     fn clipboard_hash_is_deterministic_within_run() {

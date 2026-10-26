@@ -108,6 +108,25 @@
   unsigned Windows / ad-hoc Mac signatures from notarized releases. Recheck
   native bundle load-command minimum OS versions rather than assuming support.
 
+## 2026-10-26: pre-publication deferred-request lifecycle fix
+
+- Review caught an asynchronous lifecycle regression before publication:
+  `ClientManager` reuses Slab handles, so a queued policy request could outlive
+  a deleted client and apply to its replacement after the network query ended.
+- Reject policy requests for nonexistent clients before enqueueing, and remove
+  matching deferred requests in `remove_client`, covering both explicit deletion
+  and configuration reload. Regression exercises real Slab handle reuse and
+  verifies requests for other clients retain their order.
+- `v0.17.18` was pushed but never published. Its draft release was deleted and
+  cloud packaging run 40304289490 cancelled. Preserve the tag; publish `v0.17.19`
+  from a new commit rather than rewriting a pushed tag or mislabeling binaries.
+- Final release artifacts/evidence use `dist/release-0.17.19/` and
+  `target/release-0.17.19/`; the earlier 0.17.18 outputs are not release assets.
+- Version 0.17.19 validation passed: Windows 315 workspace tests (3 ignored,
+  1 filtered), Mac arm64 355 (2 ignored, 1 filtered); both all-target/all-feature
+  Clippy runs passed. The skipped latency test and pending live acceptance are
+  unchanged. The new handle-reuse regression is included in these counts.
+
 ## Tool pitfalls
 
 - Use PowerShell quoting end-to-end. Bash-style escaped single quotes embedded

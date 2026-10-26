@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.19] - 2026-10-26
+
+### Fixed
+
+- Discard deferred network-policy requests when a client is removed or rebuilt
+  on configuration reload, and reject requests for missing clients before
+  enqueueing. This prevents a reused client handle from inheriting old requests.
+- Includes all network refresh and GUI responsiveness changes from 0.17.18.
+
+### Release status
+
+- The 0.17.18 tag was pushed, but its draft release was withdrawn after this
+  additional pre-publication review. The immutable tag remains for traceability;
+  0.17.19 is the published version of this repair.
+
+### Validation
+
+- Final 0.17.19 workspace tests: Windows 315 passed, macOS Apple Silicon 355
+  passed; both passed Clippy. The same explicit environment-sensitive test skip
+  and live-acceptance limitations documented for 0.17.18 remain in effect.
+
 ## [0.17.18] - 2026-10-26
 
 ### Fixed

@@ -72,6 +72,16 @@ inheriting potentially stale remote flags from their event source. Unrelated
 event flags and a distinguishable local opposite-side modifier are preserved.
 Same-side simultaneous local/remote ownership remains ambiguous as noted above.
 
+Native modifier readback keeps side ownership from the device-dependent flags.
+The `CGEventSourceKeyState` bitmap is only additional side-agnostic evidence:
+after a synthetic right-Shift press it can report the left key code while the
+flags correctly report right Shift. Synthesizing a left-side flag from that
+bitmap would misclassify the remote alias as a locally held key and reassert it
+during release retries. Bitmap-only evidence therefore keeps just the general
+modifier bit set until it clears; it cannot invent a side. This applies to both
+sides of Shift, Control, Option and Command, and still preserves genuine local
+opposite-side flags. Caps Lock and ordinary keys use separate injection paths.
+
 ##### macOS keyboard diagnostics
 
 Detailed keyboard logs are disabled by default. To troubleshoot the receiving

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.20] - 2026-10-27
+
+### Fixed
+
+- Stop aliased macOS modifier key-state bitmaps from inventing an opposite-side
+  modifier during release confirmation. This fixes right Shift remaining held
+  after a Windows-to-Mac key chord. Native device flags retain side ownership;
+  bitmap evidence contributes only general modifier bits.
+- Apply the same readback rule to both sides of Shift, Control, Option and
+  Command while preserving distinguishable local modifiers and stale-release
+  detection. No transport, timeout, polling or native-query changes.
+
+### Validation
+
+- Add seven regressions covering all eight modifier sides, all 65,536 native
+  side/bitmap combinations, both native readback sources, chord release and
+  cleanup, and 56 distinct remote/local modifier-side pairs.
+- Windows 322 workspace tests and macOS Apple Silicon 362 workspace tests
+  passed; both passed Clippy. The environment-sensitive unroutable-address
+  latency test remains explicitly filtered. The reported repair was confirmed
+  by the user; not every modifier combination was physically exercised.
+
+### Packages
+
+- Windows x64 installer and macOS Apple Silicon DMG only. The native local Mac
+  package requires macOS 27.0 or later because of its bundled GTK dependencies.
+  Windows is unsigned; macOS is ad-hoc signed and not Apple-notarized.
+
 ## [0.17.19] - 2026-10-26
 
 ### Fixed

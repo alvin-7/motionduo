@@ -416,6 +416,23 @@ pub(crate) fn flags_for(sides: ModifierSides) -> u32 {
     flags
 }
 
+/// Keep side ownership from native flags, not the modifier key bitmap.
+///
+/// After an IOHID right-Shift press, CGEventSourceKeyState can name left Shift
+/// while the flags correctly name the right side. Treat bitmap evidence as
+/// side-agnostic: inventing a left device bit reclassifies this alias as local
+/// input and makes a release retry press it again. Bitmap-only evidence still
+/// keeps the general bit set, so a stale key map cannot confirm a release early.
+pub(crate) fn observed_modifier_flags(flags: u32, key_sides: ModifierSides) -> u32 {
+    let mut observed = flags;
+    for side in ModifierSide::ALL {
+        if key_sides.contains(side.bit()) {
+            observed |= side.general_mask();
+        }
+    }
+    observed
+}
+
 /// The sides macOS should hold for `aggregate`, given the sides the event
 /// stream has actually identified.
 ///
@@ -1183,7 +1200,7 @@ mod tests {
         ModifierSide, ModifierSides, NX_ALTERNATEMASK, NX_COMMANDMASK, NX_CONTROLMASK,
         NX_DEVICELALTKEYMASK, NX_DEVICELCMDKEYMASK, NX_DEVICELCTLKEYMASK, NX_DEVICELSHIFTKEYMASK,
         NX_DEVICERALTKEYMASK, NX_DEVICERCMDKEYMASK, NX_DEVICERCTLKEYMASK, NX_DEVICERSHIFTKEYMASK,
-        NX_SHIFTMASK, desired_sides, flags_for, locally_held_flags,
+        NX_SHIFTMASK, desired_sides, flags_for, locally_held_flags, observed_modifier_flags,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -1301,6 +1318,200 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Models the captured right-Shift case: side flags are correct, but the
+    /// key bitmap names the left alias and outlives the first native release.
+    struct AliasedBitmapSink {
+        sink: Rc<FakeSink>,
+        raw_flags: Cell<u32>,
+        key_bitmap: Cell<ModifierSides>,
+    }
+
+    impl AliasedBitmapSink {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                sink: FakeSink::new(InjectionPath::Nx),
+                raw_flags: Cell::new(0),
+                key_bitmap: Cell::new(ModifierSides::default()),
+            })
+        }
+    }
+
+    impl KeySink for AliasedBitmapSink {
+        fn preferred_path(&self) -> InjectionPath {
+            InjectionPath::Nx
+        }
+
+        fn modifier_flags(&self) -> Option<u32> {
+            Some(observed_modifier_flags(
+                self.raw_flags.get(),
+                self.key_bitmap.get(),
+            ))
+        }
+
+        fn inject(&self, path: InjectionPath, injection: Injection) -> Result<(), i32> {
+            self.sink.inject(path, injection)?;
+            if let Injection::Modifiers { flags, .. } = injection {
+                self.raw_flags.set(flags);
+                let mut aliases = ModifierSides::default();
+                for side in ModifierSide::ALL {
+                    if side.is_default_side() && flags & side.general_mask() != 0 {
+                        aliases = aliases.with(side.bit());
+                    }
+                }
+                if !aliases.is_empty() || path == InjectionPath::CgEvent {
+                    self.key_bitmap.set(aliases);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_bitmap_cannot_invent_a_modifier_side() {
+        for side in ModifierSide::ALL {
+            let alias = side.sibling();
+            let flags = flags_for(side.bit());
+            assert_eq!(
+                observed_modifier_flags(flags, alias.bit()),
+                flags,
+                "{side:?}"
+            );
+            assert_eq!(
+                observed_modifier_flags(0, alias.bit()),
+                side.general_mask(),
+                "a bitmap-only {alias:?} must remain side-agnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn native_bitmap_preserves_real_local_sides_and_unmanaged_flags() {
+        for side in ModifierSide::ALL {
+            let flags = 0x2000_0100 | flags_for(side.bit().with(side.sibling().bit()));
+            assert_eq!(
+                observed_modifier_flags(flags, side.bit()),
+                flags,
+                "{side:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_bitmap_never_invents_side_flags_for_any_modifier_combination() {
+        let side_mask = ModifierSide::ALL
+            .into_iter()
+            .fold(0, |mask, side| mask | side.device_mask());
+        for raw in 0..=u8::MAX {
+            let flags = 0x2000_0100 | flags_for(ModifierSides::from_bits_truncate(raw));
+            for bitmap in 0..=u8::MAX {
+                let keys = ModifierSides::from_bits_truncate(bitmap);
+                let observed = observed_modifier_flags(flags, keys);
+                assert_eq!(observed & side_mask, flags & side_mask);
+                assert_eq!(observed & flags, flags);
+                for side in ModifierSide::ALL {
+                    if keys.contains(side.bit()) {
+                        assert_ne!(observed & side.general_mask(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aliased_bitmap_from_both_native_sources_cannot_materialize_a_left_side() {
+        for side in ModifierSide::ALL {
+            if side.is_default_side() {
+                continue;
+            }
+            let right = observed_modifier_flags(flags_for(side.bit()), side.sibling().bit());
+            let stale = observed_modifier_flags(0, side.sibling().bit());
+            assert_eq!(right | stale, flags_for(side.bit()), "{side:?}");
+        }
+    }
+
+    #[test]
+    fn aliased_modifier_bitmap_cannot_reassert_released_remote_input() {
+        for side in ModifierSide::ALL {
+            let sink = AliasedBitmapSink::new();
+            let injector = KeyboardInjector::new(sink.clone());
+            let kind = ModifierKinds(side.kind_bits());
+            assert!(injector.sync_modifiers(kind, side.bit(), 0));
+            injector.key_down(0x32);
+            injector.key_up(0x32).unwrap();
+            assert!(injector.sync_modifiers(
+                ModifierKinds::default(),
+                ModifierSides::default(),
+                sink.raw_flags.get()
+            ));
+            assert!(!injector.confirm_modifier_releases());
+            injector.retry_modifier_releases().unwrap();
+            assert_eq!(
+                sink.sink.calls().last(),
+                Some(&(InjectionPath::CgEvent, modifier(side.key_code(), 0))),
+                "{side:?} must not re-press the bitmap alias"
+            );
+            assert!(injector.confirm_modifier_releases());
+            assert!(injector.pending().is_empty());
+            assert_eq!(sink.raw_flags.get(), 0);
+            assert!(sink.key_bitmap.get().is_empty());
+            assert_eq!(injector.pointer_event_flags(0, 0), 0);
+        }
+    }
+
+    #[test]
+    fn aliased_modifier_release_preserves_every_distinguishable_local_side() {
+        for remote in ModifierSide::ALL {
+            for local in ModifierSide::ALL {
+                if local == remote {
+                    continue;
+                }
+                let local_flags = flags_for(local.bit());
+                let sink = AliasedBitmapSink::new();
+                sink.raw_flags.set(local_flags);
+                let injector = KeyboardInjector::new(sink.clone());
+                assert!(injector.sync_modifiers(
+                    ModifierKinds(remote.kind_bits()),
+                    remote.bit(),
+                    local_flags
+                ));
+                assert!(injector.sync_modifiers(
+                    ModifierKinds::default(),
+                    ModifierSides::default(),
+                    sink.raw_flags.get()
+                ));
+                injector.retry_modifier_releases().unwrap();
+                assert!(
+                    injector.confirm_modifier_releases(),
+                    "{remote:?} / {local:?}"
+                );
+                assert!(injector.pending().is_empty());
+                assert_eq!(sink.raw_flags.get(), local_flags, "{remote:?} / {local:?}");
+                assert_eq!(
+                    injector.pointer_event_flags(0, local_flags),
+                    u64::from(local_flags)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aliased_modifier_chord_cleanup_clears_all_eight_remote_sides() {
+        let sink = AliasedBitmapSink::new();
+        let injector = KeyboardInjector::new(sink.clone());
+        let all = ModifierSides::from_bits_truncate(u8::MAX);
+        let kinds = ModifierKinds::SHIFT
+            .with(ModifierKinds::CONTROL)
+            .with(ModifierKinds::OPTION)
+            .with(ModifierKinds::COMMAND);
+        assert!(injector.sync_modifiers(kinds, all, 0));
+        assert!(!injector.release_all().is_empty());
+        injector.retry_modifier_releases().unwrap();
+        assert!(injector.confirm_modifier_releases());
+        assert!(injector.pending().is_empty());
+        assert_eq!(sink.raw_flags.get(), 0);
+        assert!(sink.key_bitmap.get().is_empty());
     }
 
     fn pending_control_release() -> (Rc<ObservedSink>, KeyboardInjector) {

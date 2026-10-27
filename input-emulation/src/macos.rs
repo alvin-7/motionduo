@@ -26,8 +26,8 @@ use tokio::task::JoinHandle;
 use super::error::MacOSEmulationCreationError;
 use crate::macos_keyboard::{
     CleanupResidue, Injection, InjectionPath, KEYBOARD_LOG_TARGET, KeySink, KeyboardInjector,
-    ModifierKinds, ModifierSide, ModifierSides, describe_sides, flags_for, key_category, path_name,
-    wait_modifier_releases,
+    ModifierKinds, ModifierSide, ModifierSides, describe_sides, key_category,
+    observed_modifier_flags, path_name, wait_modifier_releases,
 };
 
 /// Fallback initial key-repeat delay used only when the host's
@@ -821,12 +821,14 @@ impl KeySink for MacKeySink {
             CGEventSourceStateID::HIDSystemState,
             CGEventSourceStateID::CombinedSessionState,
         ] {
-            flags |= unsafe { CGEventSourceFlagsState(source as c_int) as u32 };
+            let source_flags = unsafe { CGEventSourceFlagsState(source as c_int) as u32 };
+            let mut key_sides = ModifierSides::default();
             for side in ModifierSide::ALL {
                 if unsafe { CGEventSourceKeyState(source as c_int, side.key_code()) } {
-                    flags |= flags_for(side.bit());
+                    key_sides = key_sides.with(side.bit());
                 }
             }
+            flags |= observed_modifier_flags(source_flags, key_sides);
         }
         Some(flags)
     }

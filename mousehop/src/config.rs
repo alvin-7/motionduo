@@ -64,6 +64,14 @@ fn default_path() -> Result<PathBuf, VarError> {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 struct ConfigToml {
+    #[serde(default)]
+    input_transport: crate::transport::InputTransport,
+    global_kcp: Option<bool>,
+    clipboard_sync: Option<bool>,
+    #[serde(default)]
+    kcp_stall_timeout_ms: crate::transport::StallTimeout,
+    #[serde(default)]
+    kcp_peer_timeout_ms: crate::transport::PeerTimeout,
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
@@ -80,9 +88,14 @@ struct ConfigToml {
     /// blindly. Default true; turn off on networks where mDNS
     /// multicast (224.0.0.251) is firewalled.
     mdns_discovery: Option<bool>,
+    discovery_email: Option<String>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, IncomingPeerConfig>>,
+    /// Independent, explicit bidirectional clipboard consent, keyed by pinned
+    /// DTLS identity. Never derived from legacy directional clipboard gates.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    clipboard_device_grants: HashMap<String, bool>,
     /// Per-OS clipboard suppression lists. Each host machine reads
     /// and writes only its own OS's slot; the rest round-trip
     /// untouched so a single config can be shared across machines.
@@ -94,6 +107,16 @@ struct ConfigToml {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 struct TomlClient {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    alias: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_fingerprint: Option<String>,
+    #[serde(default)]
+    approval_paused: bool,
+    #[serde(default)]
+    approval_nonce: u64,
+    #[serde(default)]
+    alignment: mousehop_ipc::ScreenAlignment,
     hostname: Option<String>,
     host_name: Option<String>,
     ips: Option<Vec<IpAddr>>,
@@ -117,6 +140,9 @@ struct TomlClient {
     /// Absent in legacy configs and default-off.
     #[serde(default)]
     command_as_ctrl: Option<bool>,
+    #[serde(default)]
+    use_kcp: Option<bool>,
+    scroll_inertia: Option<bool>,
     /// Per-outgoing-client edge-crossing gate. Absent in legacy configs and
     /// default-off, preserving automatic crossing.
     #[serde(default)]
@@ -337,6 +363,11 @@ pub struct Config {
 }
 
 pub struct ConfigClient {
+    pub alias: String,
+    pub expected_fingerprint: Option<String>,
+    pub approval_paused: bool,
+    pub approval_nonce: u64,
+    pub alignment: mousehop_ipc::ScreenAlignment,
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
     pub port: u16,
@@ -347,12 +378,15 @@ pub struct ConfigClient {
     pub network_locks: HashMap<String, IpAddr>,
     pub clipboard_send: bool,
     pub command_as_ctrl: bool,
+    pub use_kcp: bool,
+    pub scroll_inertia: bool,
     pub require_crossing_modifier: bool,
     pub crossing_modifier: CrossingModifier,
 }
 
 impl From<TomlClient> for ConfigClient {
     fn from(toml: TomlClient) -> Self {
+        let alignment = toml.alignment;
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
         let hostname = toml.hostname;
@@ -363,9 +397,16 @@ impl From<TomlClient> for ConfigClient {
         let network_locks = toml.network_locks.unwrap_or_default();
         let clipboard_send = toml.clipboard_send.unwrap_or(false);
         let command_as_ctrl = toml.command_as_ctrl.unwrap_or(false);
+        let use_kcp = toml.use_kcp.unwrap_or(false);
+        let scroll_inertia = toml.scroll_inertia.unwrap_or(true);
         let require_crossing_modifier = toml.require_crossing_modifier.unwrap_or(false);
         let crossing_modifier = toml.crossing_modifier.unwrap_or_default();
         Self {
+            alias: mousehop_ipc::normalize_client_alias(&toml.alias).unwrap_or_default(),
+            expected_fingerprint: toml.expected_fingerprint,
+            approval_paused: toml.approval_paused,
+            approval_nonce: toml.approval_nonce,
+            alignment,
             ips,
             hostname,
             port,
@@ -376,6 +417,8 @@ impl From<TomlClient> for ConfigClient {
             network_locks,
             clipboard_send,
             command_as_ctrl,
+            use_kcp,
+            scroll_inertia,
             require_crossing_modifier,
             crossing_modifier,
         }
@@ -385,6 +428,8 @@ impl From<TomlClient> for ConfigClient {
 impl From<ConfigClient> for TomlClient {
     fn from(client: ConfigClient) -> Self {
         let hostname = client.hostname;
+        let use_kcp = Some(client.use_kcp);
+        let scroll_inertia = Some(client.scroll_inertia);
         let host_name = None;
         let mut ips = client.ips.into_iter().collect::<Vec<_>>();
         ips.sort();
@@ -426,6 +471,11 @@ impl From<ConfigClient> for TomlClient {
         let mode = (client.mode != ConnectionMode::default()).then_some(client.mode);
         let network_locks = (!client.network_locks.is_empty()).then_some(client.network_locks);
         Self {
+            alias: client.alias,
+            expected_fingerprint: client.expected_fingerprint,
+            approval_paused: client.approval_paused,
+            approval_nonce: client.approval_nonce,
+            alignment: client.alignment,
             hostname,
             host_name,
             ips,
@@ -437,6 +487,8 @@ impl From<ConfigClient> for TomlClient {
             network_locks,
             clipboard_send,
             command_as_ctrl,
+            use_kcp,
+            scroll_inertia,
             require_crossing_modifier,
             crossing_modifier,
         }
@@ -486,6 +538,8 @@ impl Config {
         }
 
         let config_toml = match ConfigToml::new(&config_path) {
+            // Invalid settings must not silently start a different transport policy.
+            Err(e @ ConfigError::Toml(_)) => return Err(e),
             Err(e) => {
                 log::warn!("{config_path:?}: {e}");
                 log::warn!("Continuing without config file ...");
@@ -585,12 +639,55 @@ impl Config {
             .or(self.config_toml.as_ref().and_then(|c| c.emulation_backend))
     }
 
-    /// the port to use (initially)
+    pub(crate) fn global_kcp(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.global_kcp)
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn set_global_kcp(&mut self, enabled: bool) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .global_kcp = Some(enabled);
+    }
+
+    pub(crate) fn clipboard_sync(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard_sync)
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn set_clipboard_sync(&mut self, enabled: bool) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .clipboard_sync = Some(enabled);
+    }
+
     pub fn port(&self) -> u16 {
         self.args
             .port
             .or(self.config_toml.as_ref().and_then(|c| c.port))
             .unwrap_or(DEFAULT_PORT)
+    }
+
+    pub(crate) fn kcp_stall_timeout(&self) -> crate::transport::StallTimeout {
+        self.config_toml
+            .as_ref()
+            .map(|c| c.kcp_stall_timeout_ms)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn kcp_timeouts(&self) -> crate::transport::Timeouts {
+        crate::transport::Timeouts {
+            stall: self.kcp_stall_timeout(),
+            peer: self
+                .config_toml
+                .as_ref()
+                .map(|c| c.kcp_peer_timeout_ms)
+                .unwrap_or_default(),
+        }
     }
 
     /// list of configured clients
@@ -601,7 +698,10 @@ impl Config {
             .unwrap_or_default()
             .into_iter()
             .flatten()
-            .map(From::<TomlClient>::from)
+            .map(|mut client| {
+                client.use_kcp = Some(self.global_kcp());
+                ConfigClient::from(client)
+            })
             .collect()
     }
 
@@ -655,6 +755,17 @@ impl Config {
             .unwrap_or(true)
     }
 
+    pub fn discovery_email(&self) -> Option<String> {
+        let value = self.config_toml.as_ref()?.discovery_email.as_deref()?;
+        crate::nearby::normalize_email(value).ok().flatten()
+    }
+
+    pub fn set_discovery_email(&mut self, email: Option<String>) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .discovery_email = email;
+    }
+
     pub fn set_mdns_discovery(&mut self, enabled: bool) {
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
@@ -683,6 +794,39 @@ impl Config {
             .as_mut()
             .expect("config")
             .authorized_fingerprints = Some(fingerprints);
+    }
+
+    /// Explicit local consent only; remote consent must be negotiated separately.
+    pub fn clipboard_device_grants(&self) -> HashMap<String, bool> {
+        self.config_toml
+            .as_ref()
+            .map(|c| c.clipboard_device_grants.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_clipboard_device_grant(&mut self, fingerprint: String, enabled: bool) {
+        let grants = &mut self
+            .config_toml
+            .get_or_insert_with(Default::default)
+            .clipboard_device_grants;
+        if enabled {
+            grants.insert(fingerprint, true);
+        } else {
+            grants.remove(&fingerprint);
+        }
+    }
+
+    /// A failed save may undo an enable, but must never undo a local revoke.
+    /// This only protects the running process; old on-disk consent may survive
+    /// a persistence failure and be loaded again after restart.
+    #[cfg(test)]
+    pub(crate) fn clipboard_grant_save_failed(
+        &mut self,
+        fingerprint: String,
+        requested: bool,
+        previous: bool,
+    ) {
+        self.set_clipboard_device_grant(fingerprint, requested && previous);
     }
 
     /// Snapshot of the persisted per-OS suppression lists.
@@ -724,6 +868,12 @@ impl Config {
         let mut changed = false;
         match toml_edit::de::from_document::<ConfigToml>(current_config) {
             Ok(current_config) => {
+                if self.kcp_timeouts().peer != current_config.kcp_peer_timeout_ms {
+                    log::info!("kcp_peer_timeout_ms changed on disk; restart Mousehop to apply");
+                }
+                if self.kcp_stall_timeout() != current_config.kcp_stall_timeout_ms {
+                    log::info!("kcp_stall_timeout_ms changed on disk; restart Mousehop to apply");
+                }
                 changed = self
                     .config_toml
                     .as_ref()
@@ -784,8 +934,143 @@ mod connection_mode_tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    #[test]
+    fn clipboard_device_consent_is_independent_persisted_and_default_off() {
+        let mut config = config_with_no_clients();
+        let legacy: ConfigToml = toml::from_str(
+            "[authorized_fingerprints.peer]\ndescription = 'old'\nclipboard_receive = true\n",
+        )
+        .unwrap();
+        assert!(legacy.clipboard_device_grants.is_empty());
+        config.config_toml = Some(legacy);
+        assert!(config.clipboard_device_grants().is_empty());
+        config.set_clipboard_device_grant("peer".into(), true);
+        config.set_clients(vec![client_with(ConnectionMode::default(), HashMap::new())]);
+        let saved = toml_edit::ser::to_string_pretty(config.config_toml.as_ref().unwrap()).unwrap();
+        let loaded: ConfigToml = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.clipboard_device_grants.get("peer"), Some(&true));
+        assert!(loaded.authorized_fingerprints.unwrap()["peer"].clipboard_receive);
+        config.set_clipboard_device_grant("peer".into(), false);
+        assert!(config.clipboard_device_grants().is_empty());
+        let saved = toml_edit::ser::to_string_pretty(config.config_toml.as_ref().unwrap()).unwrap();
+        assert!(!saved.contains("clipboard_device_grants"));
+    }
+
+    #[test]
+    fn clipboard_grant_save_failure_never_restores_revoked_consent() {
+        for previous in [false, true] {
+            for requested in [false, true] {
+                let mut config = config_with_no_clients();
+                config.set_clipboard_device_grant("peer".into(), previous);
+                config.set_clipboard_device_grant("other".into(), true);
+                // Preserve the last durable image: failure cannot update it.
+                let durable =
+                    toml_edit::ser::to_string_pretty(config.config_toml.as_ref().unwrap()).unwrap();
+                config.set_clipboard_device_grant("peer".into(), requested);
+                config.clipboard_grant_save_failed("peer".into(), requested, previous);
+                let grants = config.clipboard_device_grants();
+                assert_eq!(
+                    grants.get("peer").copied().unwrap_or(false),
+                    previous && requested,
+                    "previous={previous}, requested={requested}"
+                );
+                assert_eq!(grants.get("other"), Some(&true));
+                let restarted: ConfigToml = toml::from_str(&durable).unwrap();
+                assert_eq!(
+                    restarted
+                        .clipboard_device_grants
+                        .get("peer")
+                        .copied()
+                        .unwrap_or(false),
+                    previous,
+                    "failed persistence cannot revoke consent across restart"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kcp_timeout_default_bounds_and_save_roundtrip() {
+        let defaults: ConfigToml = toml::from_str("").unwrap();
+        assert_eq!(defaults.kcp_stall_timeout_ms.milliseconds(), 600);
+        assert_eq!(ConfigToml::default(), defaults);
+        for value in [1, 300, 1000, 60000] {
+            let mut config = config_with_no_clients();
+            config.config_toml =
+                Some(toml::from_str(&format!("kcp_stall_timeout_ms = {value}")).unwrap());
+            config.set_clients(vec![client_with(ConnectionMode::default(), HashMap::new())]);
+            let saved =
+                toml_edit::ser::to_string_pretty(config.config_toml.as_ref().unwrap()).unwrap();
+            let loaded: ConfigToml = toml::from_str(&saved).unwrap();
+            assert_eq!(loaded.kcp_stall_timeout_ms.milliseconds(), value);
+        }
+    }
+
+    #[test]
+    fn kcp_timeout_rejects_invalid_values() {
+        for value in [
+            "0",
+            "60001",
+            "-1",
+            "18446744073709551616",
+            "1.5",
+            "'300'",
+            "true",
+        ] {
+            let error = toml::from_str::<ConfigToml>(&format!("kcp_stall_timeout_ms = {value}"))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("kcp_stall_timeout_ms"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_transport_requires_explicit_valid_selection() {
+        use crate::transport::InputTransport;
+        let legacy: ConfigToml = toml::from_str("").unwrap();
+        assert_eq!(legacy.input_transport, InputTransport::Legacy);
+        let required: ConfigToml = toml::from_str("input_transport = 'kcp-required'").unwrap();
+        assert_eq!(required.input_transport, InputTransport::KcpRequired);
+        let round_trip: ConfigToml = toml::from_str(&toml::to_string(&required).unwrap()).unwrap();
+        assert_eq!(round_trip.input_transport, InputTransport::KcpRequired);
+        assert!(toml::from_str::<ConfigToml>("input_transport = 'automatic'").is_err());
+    }
+
+    #[test]
+    fn local_alias_roundtrips_independently_of_hostname_and_pin() {
+        let legacy: TomlClient = toml::from_str("hostname = 'host.local'").unwrap();
+        assert!(ConfigClient::from(legacy).alias.is_empty());
+        let mut client = client_with(ConnectionMode::default(), HashMap::new());
+        client.alias = "工作电脑".into();
+        client.expected_fingerprint = Some("certificate-identity".into());
+        let encoded = toml::to_string(&TomlClient::from(client)).unwrap();
+        let decoded = ConfigClient::from(toml::from_str::<TomlClient>(&encoded).unwrap());
+        assert_eq!(decoded.alias, "工作电脑");
+        assert_eq!(decoded.hostname.as_deref(), Some("host.local"));
+        assert_eq!(
+            decoded.expected_fingerprint.as_deref(),
+            Some("certificate-identity")
+        );
+        let mut cleared = decoded;
+        cleared.alias.clear();
+        let encoded = toml::to_string(&TomlClient::from(cleared)).unwrap();
+        assert!(!encoded.contains("alias"));
+        assert!(
+            ConfigClient::from(toml::from_str::<TomlClient>(&encoded).unwrap())
+                .alias
+                .is_empty()
+        );
+    }
+
     fn client_with(mode: ConnectionMode, locks: HashMap<String, IpAddr>) -> ConfigClient {
         ConfigClient {
+            alias: String::new(),
+            expected_fingerprint: None,
+            approval_paused: false,
+            approval_nonce: 0,
+            alignment: Default::default(),
             ips: Default::default(),
             hostname: Some("host.local".into()),
             port: DEFAULT_PORT,
@@ -796,9 +1081,25 @@ mod connection_mode_tests {
             network_locks: locks,
             clipboard_send: false,
             command_as_ctrl: false,
+            use_kcp: false,
+            scroll_inertia: false,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         }
+    }
+
+    #[test]
+    fn discovered_certificate_pin_round_trips_without_changing_legacy_clients() {
+        let legacy: TomlClient = toml::from_str("hostname = 'peer.local'").unwrap();
+        assert!(ConfigClient::from(legacy).expected_fingerprint.is_none());
+        let mut client = client_with(ConnectionMode::Auto, HashMap::new());
+        client.expected_fingerprint = Some("persisted-device-identity".into());
+        let persisted = toml::to_string(&TomlClient::from(client)).unwrap();
+        let restored: TomlClient = toml::from_str(&persisted).unwrap();
+        assert_eq!(
+            ConfigClient::from(restored).expected_fingerprint.as_deref(),
+            Some("persisted-device-identity")
+        );
     }
 
     fn config_with_no_clients() -> Config {
@@ -825,6 +1126,59 @@ mod connection_mode_tests {
             watcher,
             watch_rx,
         }
+    }
+
+    #[test]
+    fn global_settings_default_on_and_roundtrip_explicit_false() {
+        let mut config = config_with_no_clients();
+        assert!(config.global_kcp());
+        assert!(config.clipboard_sync());
+        config.set_global_kcp(false);
+        config.set_clipboard_sync(false);
+        let saved = toml::to_string(config.config_toml.as_ref().unwrap()).unwrap();
+        config.config_toml = Some(toml::from_str(&saved).unwrap());
+        assert!(!config.global_kcp());
+        assert!(!config.clipboard_sync());
+        config.set_global_kcp(true);
+        config.set_clipboard_sync(true);
+        assert!(config.global_kcp() && config.clipboard_sync());
+    }
+
+    #[test]
+    fn global_kcp_overrides_legacy_per_client_preferences() {
+        let mut config = config_with_no_clients();
+        config.config_toml = Some(
+            toml::from_str(
+                r#"
+input_transport = "kcp-required"
+[[clients]]
+hostname = "inherited"
+[[clients]]
+hostname = "disabled"
+use_kcp = false
+[[clients]]
+hostname = "enabled"
+use_kcp = true
+"#,
+            )
+            .unwrap(),
+        );
+        let clients = config.clients();
+        assert_eq!(
+            clients.iter().map(|c| c.use_kcp).collect::<Vec<_>>(),
+            vec![true, true, true]
+        );
+        config.set_clients(clients);
+        let saved = toml::to_string(config.config_toml.as_ref().unwrap()).unwrap();
+        config.config_toml = Some(toml::from_str(&saved).unwrap());
+        assert_eq!(
+            config
+                .clients()
+                .iter()
+                .map(|c| c.use_kcp)
+                .collect::<Vec<_>>(),
+            vec![true, true, true]
+        );
     }
 
     #[test]
@@ -899,6 +1253,54 @@ mod connection_mode_tests {
 
         let back: ConfigClient = toml.into();
         assert!(back.command_as_ctrl);
+    }
+
+    #[test]
+    fn peer_timeout_is_independent_validated_and_saved() {
+        let defaults: ConfigToml = toml::from_str("").unwrap();
+        assert_eq!(defaults.kcp_peer_timeout_ms.milliseconds(), 3000);
+        for value in [1, 1500, 5000, 60000] {
+            let mut config = config_with_no_clients();
+            config.config_toml = Some(
+                toml::from_str(&format!(
+                    "kcp_stall_timeout_ms = 250\nkcp_peer_timeout_ms = {value}"
+                ))
+                .unwrap(),
+            );
+            config.set_clients(vec![client_with(ConnectionMode::default(), HashMap::new())]);
+            let serialized =
+                toml_edit::ser::to_string_pretty(config.config_toml.as_ref().unwrap()).unwrap();
+            let loaded: ConfigToml = toml::from_str(&serialized).unwrap();
+            assert_eq!(loaded.kcp_stall_timeout_ms.milliseconds(), 250);
+            assert_eq!(loaded.kcp_peer_timeout_ms.milliseconds(), value);
+            assert_eq!(config.kcp_timeouts().peer.milliseconds(), value);
+        }
+        for value in [
+            "0",
+            "60001",
+            "-1",
+            "1.5",
+            "'1500'",
+            "true",
+            "18446744073709551616",
+        ] {
+            assert!(
+                toml::from_str::<ConfigToml>(&format!("kcp_peer_timeout_ms = {value}")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_inertia_defaults_on_and_roundtrips_per_device() {
+        let legacy: TomlClient = toml::from_str("hostname = 'windows'").unwrap();
+        assert!(ConfigClient::from(legacy).scroll_inertia);
+        for enabled in [false, true] {
+            let mut client = client_with(ConnectionMode::default(), HashMap::new());
+            client.scroll_inertia = enabled;
+            let saved = toml::to_string(&TomlClient::from(client)).unwrap();
+            let reloaded: TomlClient = toml::from_str(&saved).unwrap();
+            assert_eq!(ConfigClient::from(reloaded).scroll_inertia, enabled);
+        }
     }
 
     #[test]

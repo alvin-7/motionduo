@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mousehop: Discovery, Revocation and Device Name</title>
+<style>
+:root{--ink:#22252a;--muted:#68707c;--line:#dce2e7;--accent:#246c59}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(125deg,#edf2f0,#f7f5f0);color:var(--ink);font:15px/1.6 Georgia,serif}
+main{max-width:980px;margin:36px auto;padding:30px;background:#fff;border:1px solid var(--line);border-radius:12px}
+h1{font-size:30px;line-height:1.2;margin:8px 0 12px}h2{font-size:21px;margin:28px 0 8px}p{margin:8px 0}
+.meta,small{color:var(--muted)}.tag{color:var(--accent);font:bold 12px/1.4 monospace;text-transform:uppercase;letter-spacing:1px}
+code{font-size:12px;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
+a{color:#265ca0}img{max-width:100%;border:1px solid var(--line);border-radius:8px}.notice{border-left:3px solid var(--accent);padding:8px 14px;background:#f1f6f3}
+@media(max-width:700px){main{margin:12px;padding:18px}h1{font-size:26px}th,td{padding:6px;font-size:12px}}
+</style>
+<main>
+<div class="tag">Verified Engineering Record / 2026-10-28</div>
+<h1>Discovery, Access Revocation &amp; Local Identity</h1>
+<p class="meta">MyGo native frontend. Existing dirty <code>mygo</code> branch; no installation, application restart, commit or publication performed.</p>
+<div class="notice">The existing 10:10 test installers and DMG are unchanged. They do not contain these fixes. Updated source/builds use frontend IPC revision 4; the earlier test packages use revision 3.</div>
+
+<h2>1. Confirmed: Removing Access Left Sessions Alive</h2>
+<p><code>service.rs::remove_authorized_key</code> removed the certificate from the authorization map and updated frontend settings. Existing TLS sessions were not closed. The handshake callback rejects future sessions, but cannot revoke already-authenticated ones.</p>
+<p>Reproduced both with two isolated Windows daemons and across physical Windows/macOS hosts using isolated dummy-backend daemons. Before the fix, authorization disappeared but the sender remained alive throughout the three-second disconnect budget and a subsequent four-second observation.</p>
+<p>The listener now retires the exact session token and connection slot before awaiting bounded transport close. The emulation task checks current authorization for queued accepts and incoming messages, and disconnects revoked sessions on authorization updates. Existing disconnect cleanup releases emulation state. The service no longer publishes stale Connected/Entered events for a revoked identity.</p>
+<p>A separate stale-UI path is corrected: a connection that never entered the screen still emits <code>IncomingDisconnected</code>. The MyGo model also removes revoked incoming live/locked state without clearing unrelated peers.</p>
+<p><a href="../../mousehop/src/listen.rs">listen.rs</a> &middot; <a href="../../mousehop/src/emulation.rs">emulation.rs</a> &middot; <a href="../../mousehop/src/service.rs">service.rs</a> &middot; <a href="../../mousehop-mygo/model.go">model.go</a></p>
+
+<h2>2. Discovery: In-Place Updates, Not Goodbye/Rejoin</h2>
+<p>Changing email previously unregistered and immediately re-registered the same service fullname. Pinned <code>mdns-sd 0.19.1</code> explicitly supports calling <code>register</code> again to update a service. Unregister additionally schedules a delayed goodbye packet, creating an avoidable overlap with the new advertisement. The same fullname is now updated in place; a genuinely different name is still unregistered.</p>
+<p><strong>Evidence boundary:</strong> the reported long, asymmetric discovery delay was not reproduced. The original cross-host test discovered the later-configured Mac in 1.838 seconds; the fixed test took 0.955 seconds. These are individual observations, not a latency guarantee or proof that the goodbye race caused the user's exact incident.</p>
+<p>No new periodic scan, frame timer or high-frequency network polling was added. The existing 30-second network-interface refresh is unchanged.</p>
+
+<h2>3. Local Name Replaces the Page Brand</h2>
+<p>The daemon emits <code>LocalDeviceName</code> using the same helper that constructs its advertised service name. The page header and local screen-layout tile use that authoritative value. Long names remain on one line, with the complete name available on hover. Navigation remains inside both supported widths. Application/window identity, tray and menu-bar branding remain Mousehop.</p>
+<p><a href="../../mousehop-mygo/view.go">view.go</a> &middot; <a href="../../mousehop-mygo/layout_view.go">layout_view.go</a> &middot; <a href="../../mousehop-ipc/src/lib.rs">IPC definition</a></p>
+<img src="../../target/nearby-revoke-20261028/screens/Screen-layout-680.png" alt="Native renderer fixture showing Studio-PC in the toolbar and local screen">
+<small>MyGo renderer test fixture, not an installed-application screenshot.</small>
+
+<h2>Verification</h2>
+<table>
+<tr><th>Check</th><th>Result</th><th>Scope</th></tr>
+<tr><td>Rust tests</td><td>197 passed, 1 ignored</td><td><code>mousehop</code> and <code>mousehop-ipc</code>; Windows</td></tr>
+<tr><td>Go tests</td><td>134 Windows / 126 macOS passed</td><td>Includes subtests; local name, hover, compact navigation, revocation model and existing UI interactions</td></tr>
+<tr><td>Static checks</td><td>Pass</td><td>Rust fmt; workspace clippy all-targets/all-features; Go vet on Windows and macOS. Existing Cargo default-feature warnings remain.</td></tr>
+<tr><td>Native builds</td><td>Pass</td><td>Windows debug backend/frontend with icon resource; macOS ARM64 optimized backend and native Go frontend</td></tr>
+<tr><td>Real Win &rarr; Mac network</td><td>9/9 regression checks passed</td><td>Staggered email, stable discovery, remote email change/removal/return, advertised-name agreement, live revocation and no authorized reconnection</td></tr>
+<tr><td>Existing LAN smoke</td><td>Pass</td><td>Approval, actual certificate pin, atomic screen placement/endpoint editing and release settings</td></tr>
+</table>
+<p>Cross-host fixtures use independent configs, certificates, UDP/IPC endpoints and unique names. Spawned daemon PID/version is verified before mutation. They use dummy capture/emulation and do not inject physical input. Installed applications and their settings are untouched.</p>
+<p>Revocation blocks control and drops live connectivity. An enabled outgoing device can still retry and request fresh approval; this is not a successful connection. There is no authenticated wire-level revocation-reason message in this patch, so the sender must not claim to know the remote user's intent.</p>
+<p>Still unverified: installed-application visual interaction on both hosts after packaging, real held-key release during revocation, and the original intermittent discovery delay under its original conditions.</p>
+<p><a href="../../target/nearby-revoke-20261028/cross-baseline/result.json">Cross-host baseline</a> &middot; <a href="../../target/nearby-revoke-20261028/cross-final-verified/result.json">Cross-host fixed result</a> &middot; <a href="../../scripts/test-mygo-presence.py">Repeatable regression script</a></p>
+</main>
+</html>

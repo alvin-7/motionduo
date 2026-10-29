@@ -18,6 +18,18 @@ use serde::{Deserialize, Serialize};
 
 pub use input_event::{CrossingModifier, scancode};
 
+/// Native frontend IPC revision, independent of the peer DTLS protocol.
+pub const NATIVE_FRONTEND_IPC_VERSION: u32 = 8;
+
+/// Local display metadata only; never used as a hostname or certificate identity.
+pub fn normalize_client_alias(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.chars().count() > 128 || value.chars().any(char::is_control) {
+        return Err("Enter an alias of at most 128 characters without control characters");
+    }
+    Ok(value.to_owned())
+}
+
 mod connect;
 mod connect_async;
 mod listen;
@@ -344,6 +356,17 @@ pub enum IfaceKind {
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
+    #[serde(default)]
+    pub alias: String,
+    /// Pinned remote DTLS certificate for a device selected from discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_fingerprint: Option<String>,
+    #[serde(default)]
+    pub approval_paused: bool,
+    #[serde(default)]
+    pub approval_nonce: u64,
+    #[serde(default)]
+    pub alignment: ScreenAlignment,
     /// hostname of this client
     pub hostname: Option<String>,
     /// fix ips, determined by the user
@@ -385,6 +408,12 @@ pub struct ClientConfig {
     /// `false` so existing peers keep their current modifier mapping.
     #[serde(default)]
     pub command_as_ctrl: bool,
+    /// Effective outgoing preference. Incoming connections negotiate independently.
+    #[serde(default)]
+    pub use_kcp: bool,
+    /// Replay source trackpad momentum on this outgoing connection by default.
+    #[serde(default = "default_true")]
+    pub scroll_inertia: bool,
     /// When true, the pointer may enter this outgoing client only while
     /// [`Self::crossing_modifier`] is physically held. Default-off preserves
     /// the historical automatic edge crossing for existing configurations.
@@ -397,9 +426,18 @@ pub struct ClientConfig {
     pub crossing_modifier: CrossingModifier,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            alias: String::new(),
+            expected_fingerprint: None,
+            approval_paused: false,
+            approval_nonce: 0,
+            alignment: ScreenAlignment::default(),
             port: DEFAULT_PORT,
             hostname: Default::default(),
             fix_ips: Default::default(),
@@ -409,6 +447,8 @@ impl Default for ClientConfig {
             network_locks: HashMap::new(),
             clipboard_send: false,
             command_as_ctrl: false,
+            use_kcp: false,
+            scroll_inertia: true,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         }
@@ -416,6 +456,127 @@ impl Default for ClientConfig {
 }
 
 pub type ClientHandle = u64;
+
+/// Editable endpoint fields only; identity pins and sharing permissions are not changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientConnectionConfig {
+    pub hostname: Option<String>,
+    pub fix_ips: Vec<IpAddr>,
+    pub port: u16,
+    pub cmd: Option<String>,
+}
+
+impl From<&ClientConfig> for ClientConnectionConfig {
+    fn from(config: &ClientConfig) -> Self {
+        Self {
+            hostname: config.hostname.clone(),
+            fix_ips: config.fix_ips.clone(),
+            port: config.port,
+            cmd: config.cmd.clone(),
+        }
+    }
+}
+
+impl ClientConnectionConfig {
+    pub fn is_valid(&self) -> bool {
+        self.port != 0
+            && (self.hostname.is_some() || !self.fix_ips.is_empty())
+            && self.hostname.as_ref().is_none_or(|host| {
+                !host.is_empty()
+                    && host.len() <= 253
+                    && !host.chars().any(|c| c.is_control() || c.is_whitespace())
+            })
+    }
+
+    pub fn same_endpoint(&self, other: &Self) -> bool {
+        self.hostname == other.hostname && self.fix_ips == other.fix_ips && self.port == other.port
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenAlignment {
+    #[default]
+    Proportional,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ScreenAlignment {
+    /// Preserve physical distance along the shared edge. A point outside the
+    /// overlapping edge must not cross to the other computer.
+    pub fn map_cursor(
+        self,
+        pos: Position,
+        cursor: (f32, f32),
+        source: (u32, u32),
+        target: (u32, u32),
+    ) -> Option<(f32, f32)> {
+        if !cursor.0.is_finite() || !cursor.1.is_finite() {
+            return None;
+        }
+        if self == Self::Proportional {
+            return Some(cursor);
+        }
+        let vertical = matches!(pos, Position::Left | Position::Right);
+        let (from, to, value, end) = if vertical {
+            (
+                source.1,
+                target.1,
+                cursor.1,
+                matches!(self, Self::BottomLeft | Self::BottomRight),
+            )
+        } else {
+            (
+                source.0,
+                target.0,
+                cursor.0,
+                matches!(self, Self::TopRight | Self::BottomRight),
+            )
+        };
+        if from == 0 || to == 0 {
+            return None;
+        }
+        let offset = if end {
+            f64::from(from) - f64::from(to)
+        } else {
+            0.0
+        };
+        let coordinate =
+            (f64::from(value).clamp(0.0, 1.0) * f64::from(from)).min(f64::from(from - 1)) - offset;
+        if !(-1e-4..f64::from(to)).contains(&coordinate) {
+            return None;
+        }
+        let mapped = (coordinate.max(0.0) / f64::from(to)) as f32;
+        Some(if vertical {
+            (cursor.0, mapped)
+        } else {
+            (mapped, cursor.1)
+        })
+    }
+}
+
+/// Untrusted mDNS metadata. Neither email membership nor this advertised
+/// fingerprint grants input access; approval binds the actual DTLS certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredDevice {
+    pub id: String,
+    pub name: String,
+    pub hostname: String,
+    pub addresses: Vec<IpAddr>,
+    pub port: u16,
+    pub fingerprint: String,
+    pub platform: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingRequest {
+    pub id: String,
+    pub name: String,
+    pub addresses: Vec<IpAddr>,
+}
 
 /// Per-incoming-peer settings, keyed on the peer's TLS certificate
 /// fingerprint in `Config::authorized_fingerprints`. Holds the
@@ -465,7 +626,7 @@ impl Default for IncomingPeerConfig {
     fn default() -> Self {
         Self {
             description: String::new(),
-            natural_scroll: false,
+            natural_scroll: true,
             mouse_sensitivity: 1.0,
             last_addr: None,
             last_hostname: None,
@@ -484,7 +645,7 @@ impl<'de> Deserialize<'de> for IncomingPeerConfig {
             Legacy(String),
             Full {
                 description: String,
-                #[serde(default)]
+                #[serde(default = "default_natural_scroll")]
                 natural_scroll: bool,
                 #[serde(default = "default_sensitivity")]
                 mouse_sensitivity: f64,
@@ -495,6 +656,9 @@ impl<'de> Deserialize<'de> for IncomingPeerConfig {
                 #[serde(default)]
                 clipboard_receive: bool,
             },
+        }
+        fn default_natural_scroll() -> bool {
+            true
         }
         fn default_sensitivity() -> f64 {
             1.0
@@ -525,6 +689,11 @@ impl<'de> Deserialize<'de> for IncomingPeerConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
+    #[serde(default)]
+    pub display_size: Option<(u32, u32)>,
+    /// Actual session state, never inferred from the preference switch.
+    #[serde(default)]
+    pub transport_status: String,
     /// events should be sent to and received from the client
     pub active: bool,
     /// `active` address of the client, used to send data to.
@@ -593,6 +762,19 @@ pub enum RemoteHostState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
+    GlobalKcp(bool),
+    ClipboardSync(bool),
+    /// The same device name advertised to nearby peers.
+    LocalDeviceName(String),
+    LocalDisplaySize(Option<(u32, u32)>),
+    ServiceIdentity {
+        pid: u32,
+        version: String,
+        ipc_version: u32,
+    },
+    DiscoveryEmail(Option<String>),
+    NearbyDevices(Vec<DiscoveredDevice>),
+    PairingRequests(Vec<PairingRequest>),
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -638,7 +820,9 @@ pub enum FrontendEvent {
         state: RemoteHostState,
     },
     /// failed connection attempt (approval for fingerprint required)
-    ConnectionAttempt { fingerprint: String },
+    ConnectionAttempt {
+        fingerprint: String,
+    },
     /// pixel threshold for the wall-press auto-release fallback.
     /// 0 means disabled.
     ReleaseThreshold(u32),
@@ -662,6 +846,9 @@ pub enum FrontendEvent {
     /// X11. Other-OS sections in `config.toml` are intentionally
     /// not surfaced — you edit those by sitting in front of that
     /// machine.
+    /// Full replacement snapshot of explicit local bidirectional clipboard grants.
+    /// A missing identity is denied. This is not remote consent or transfer readiness.
+    ClipboardDeviceGrants(HashMap<String, bool>),
     SuppressedAppsUpdated(Vec<String>),
     /// Reply to [`FrontendRequest::ListRunningApps`]: best-effort
     /// list of apps currently running on this device. Empty when
@@ -690,6 +877,24 @@ pub struct RunningApp {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
+    SetGlobalKcp(bool),
+    SetClipboardSync(bool),
+    /// Set independent bidirectional clipboard consent for a known pinned identity.
+    /// Does not alter input authorization or legacy directional clipboard gates.
+    SetClipboardDeviceGrant(String, bool),
+    /// Only a frontend that spawned this daemon has this process-local capability.
+    Shutdown(String),
+    ConnectManual(String, u16, Position),
+    UpdateScreenAlignment(ClientHandle, ScreenAlignment),
+    /// Commit a drag's edge and corner together, without an intermediate layout.
+    UpdateScreenPlacement(ClientHandle, Position, ScreenAlignment),
+    /// Save endpoint fields together, with at most one reconnect and config write.
+    SetClientAlias(ClientHandle, String),
+    UpdateConnection(ClientHandle, ClientConnectionConfig),
+    SetDiscoveryEmail(String),
+    ConnectDiscovered(String, Position),
+    RetryApproval(ClientHandle),
+    RespondPairing(String, bool),
     /// activate/deactivate client
     Activate(ClientHandle, bool),
     /// add a new client
@@ -745,6 +950,9 @@ pub enum FrontendRequest {
     /// On a macOS sender, toggle the one-way Command-to-Control alias
     /// for the given outgoing client.
     SetClientCommandAsCtrl(ClientHandle, bool),
+    /// Persist this peer's transport preference and reconnect only this peer.
+    SetClientUseKcp(ClientHandle, bool),
+    SetClientScrollInertia(ClientHandle, bool),
     /// Toggle whether crossing into an outgoing client requires its selected
     /// modifier to be held.
     SetClientRequireCrossingModifier(ClientHandle, bool),
@@ -799,8 +1007,25 @@ impl From<Status> for bool {
 #[cfg(unix)]
 const MOUSEHOP_SOCKET_NAME: &str = "mousehop-socket.sock";
 
+#[cfg(windows)]
+pub fn tcp_endpoint() -> io::Result<SocketAddr> {
+    let value = std::env::var("MOUSEHOP_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:5252".into());
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid IPC endpoint"))?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPC endpoint must be loopback with a nonzero port",
+        ));
+    }
+    Ok(address)
+}
+
 #[derive(Debug, Error)]
 pub enum SocketPathError {
+    #[error("MOUSEHOP_SOCKET_PATH must be an absolute path")]
+    InvalidOverride,
     #[error("could not determine $XDG_RUNTIME_DIR: `{0}`")]
     XdgRuntimeDirNotFound(VarError),
     #[error("could not determine $HOME: `{0}`")]
@@ -809,6 +1034,14 @@ pub enum SocketPathError {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
+    if let Some(value) = env::var_os("MOUSEHOP_SOCKET_PATH") {
+        let path = PathBuf::from(value);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(SocketPathError::InvalidOverride)
+        };
+    }
     let xdg_runtime_dir =
         env::var("XDG_RUNTIME_DIR").map_err(SocketPathError::XdgRuntimeDirNotFound)?;
     Ok(Path::new(xdg_runtime_dir.as_str()).join(MOUSEHOP_SOCKET_NAME))
@@ -816,6 +1049,14 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
 
 #[cfg(all(unix, target_os = "macos"))]
 pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
+    if let Some(value) = env::var_os("MOUSEHOP_SOCKET_PATH") {
+        let path = PathBuf::from(value);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(SocketPathError::InvalidOverride)
+        };
+    }
     let home = env::var("HOME").map_err(SocketPathError::HomeDirNotFound)?;
     Ok(Path::new(home.as_str())
         .join("Library")
@@ -826,6 +1067,140 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_consent_has_independent_request_and_snapshot() {
+        let request: FrontendRequest =
+            serde_json::from_str(r#"{"SetClipboardDeviceGrant":["peer",true]}"#).unwrap();
+        assert!(
+            matches!(request, FrontendRequest::SetClipboardDeviceGrant(ref fp, true) if fp == "peer")
+        );
+        let event = FrontendEvent::ClipboardDeviceGrants(HashMap::from([("peer".into(), true)]));
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["ClipboardDeviceGrants"]["peer"], true);
+    }
+
+    #[test]
+    fn native_drag_placement_is_one_ipc_request() {
+        let value = r#"{"UpdateScreenPlacement":[7,"left","top_left"]}"#;
+        let request: FrontendRequest = serde_json::from_str(value).unwrap();
+        assert!(matches!(
+            request,
+            FrontendRequest::UpdateScreenPlacement(7, Position::Left, ScreenAlignment::TopLeft)
+        ));
+        assert_eq!(serde_json::to_string(&request).unwrap(), value);
+        assert_eq!(NATIVE_FRONTEND_IPC_VERSION, 8);
+    }
+
+    #[test]
+    fn local_alias_request_validation_and_legacy_defaults() {
+        assert_eq!(normalize_client_alias("  工作电脑  ").unwrap(), "工作电脑");
+        assert_eq!(normalize_client_alias(" \t ").unwrap(), "");
+        assert!(normalize_client_alias(&"名".repeat(128)).is_ok());
+        for value in ["名".repeat(129), "a\nb".into(), "a\0b".into()] {
+            assert!(normalize_client_alias(&value).is_err());
+        }
+        let value = r#"{"SetClientAlias":[7,"Office"]}"#;
+        let request: FrontendRequest = serde_json::from_str(value).unwrap();
+        assert!(matches!(&request, FrontendRequest::SetClientAlias(7, alias) if alias == "Office"));
+        assert_eq!(serde_json::to_string(&request).unwrap(), value);
+        let mut config = ClientConfig::default();
+        let mut json = serde_json::to_value(&config).unwrap();
+        json.as_object_mut().unwrap().remove("alias");
+        assert!(
+            serde_json::from_value::<ClientConfig>(json)
+                .unwrap()
+                .alias
+                .is_empty()
+        );
+        config.alias = "Office".into();
+        assert_eq!(
+            serde_json::from_str::<ClientConfig>(&serde_json::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn native_connection_edit_is_one_validated_request() {
+        let value = r#"{"UpdateConnection":[7,{"hostname":"office.local","fix_ips":["192.0.2.7","2001:db8::7"],"port":4253,"cmd":null}]}"#;
+        let request: FrontendRequest = serde_json::from_str(value).unwrap();
+        assert_eq!(serde_json::to_string(&request).unwrap(), value);
+        let FrontendRequest::UpdateConnection(7, mut config) = request else {
+            panic!("wrong request");
+        };
+        assert!(config.is_valid());
+        config.hostname = None;
+        assert!(config.is_valid());
+        config.fix_ips.clear();
+        assert!(!config.is_valid());
+        config.hostname = Some("office.local".into());
+        config.port = 0;
+        assert!(!config.is_valid());
+        config.port = 4252;
+        for host in ["", "space here", "line\nbreak"] {
+            config.hostname = Some(host.into());
+            assert!(!config.is_valid());
+        }
+    }
+
+    #[test]
+    fn corner_mapping_preserves_distance_and_rejects_nonoverlap() {
+        let source = (1920, 1080);
+        let target = (1280, 720);
+        for side in [Position::Left, Position::Right] {
+            for alignment in [ScreenAlignment::TopLeft, ScreenAlignment::TopRight] {
+                let point = alignment
+                    .map_cursor(side, (0.0, 540.0 / 1080.0), source, target)
+                    .unwrap();
+                assert!((point.1 - 540.0 / 720.0).abs() < 1e-5);
+                assert!(
+                    alignment
+                        .map_cursor(side, (0.0, 900.0 / 1080.0), source, target)
+                        .is_none()
+                );
+            }
+            for alignment in [ScreenAlignment::BottomLeft, ScreenAlignment::BottomRight] {
+                let point = alignment
+                    .map_cursor(side, (0.0, 540.0 / 1080.0), source, target)
+                    .unwrap();
+                assert!((point.1 - 180.0 / 720.0).abs() < 1e-5);
+                let returned = alignment.map_cursor(side, point, target, source).unwrap();
+                assert!((returned.1 - 0.5).abs() < 1e-5);
+                assert!(
+                    alignment
+                        .map_cursor(side, (0.0, 100.0 / 1080.0), source, target)
+                        .is_none()
+                );
+            }
+        }
+        for side in [Position::Top, Position::Bottom] {
+            let left = ScreenAlignment::TopLeft
+                .map_cursor(side, (960.0 / 1920.0, 0.0), source, target)
+                .unwrap();
+            let right = ScreenAlignment::BottomRight
+                .map_cursor(side, (960.0 / 1920.0, 0.0), source, target)
+                .unwrap();
+            assert!((left.0 - 960.0 / 1280.0).abs() < 1e-5);
+            assert!((right.0 - 320.0 / 1280.0).abs() < 1e-5);
+        }
+        assert!(
+            ScreenAlignment::TopLeft
+                .map_cursor(Position::Left, (0.0, f32::NAN), source, target)
+                .is_none()
+        );
+        assert_eq!(
+            ScreenAlignment::Proportional.map_cursor(Position::Left, (0.2, 0.8), source, target),
+            Some((0.2, 0.8))
+        );
+    }
+
+    #[test]
+    fn legacy_clients_default_to_proportional_alignment() {
+        let mut config = serde_json::to_value(ClientConfig::default()).unwrap();
+        config.as_object_mut().unwrap().remove("alignment");
+        let decoded: ClientConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(decoded.alignment, ScreenAlignment::Proportional);
+    }
 
     #[test]
     fn app_ident_matches_within_variant_case_insensitive() {
@@ -925,9 +1300,37 @@ mod tests {
         let json = r#""my laptop""#;
         let peer: IncomingPeerConfig = serde_json::from_str(json).unwrap();
         assert_eq!(peer.description, "my laptop");
-        assert!(!peer.natural_scroll);
+        assert!(peer.natural_scroll);
         assert!(!peer.clipboard_receive);
         assert_eq!(peer.mouse_sensitivity, 1.0);
+    }
+
+    #[test]
+    fn scroll_defaults_on_but_explicit_false_survives() {
+        let missing: IncomingPeerConfig =
+            serde_json::from_str(r#"{"description":"peer"}"#).unwrap();
+        let disabled: IncomingPeerConfig =
+            serde_json::from_str(r#"{"description":"peer","natural_scroll":false}"#).unwrap();
+        assert!(missing.natural_scroll);
+        assert!(!disabled.natural_scroll);
+        assert!(
+            !serde_json::from_str::<IncomingPeerConfig>(&serde_json::to_string(&disabled).unwrap())
+                .unwrap()
+                .natural_scroll
+        );
+        let mut json = serde_json::to_value(ClientConfig::default()).unwrap();
+        json.as_object_mut().unwrap().remove("scroll_inertia");
+        assert!(
+            serde_json::from_value::<ClientConfig>(json.clone())
+                .unwrap()
+                .scroll_inertia
+        );
+        json["scroll_inertia"] = false.into();
+        assert!(
+            !serde_json::from_value::<ClientConfig>(json)
+                .unwrap()
+                .scroll_inertia
+        );
     }
 
     #[test]

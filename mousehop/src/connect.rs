@@ -39,6 +39,7 @@ pub(crate) type ConnectionSession = u64;
 struct ConnectionSlot {
     handle: ClientHandle,
     session: ConnectionSession,
+    fingerprint: String,
     conn: ArcConn,
 }
 
@@ -84,6 +85,8 @@ pub(crate) enum MousehopConnectionError {
     Dtls(#[from] webrtc_dtls::Error),
     #[error(transparent)]
     Webrtc(#[from] webrtc_util::Error),
+    #[error("approval denied or expired; explicitly request again")]
+    ApprovalPaused,
     #[error("not connected")]
     NotConnected,
     #[error("emulation is disabled on the target device")]
@@ -98,11 +101,16 @@ pub(crate) enum MousehopConnectionError {
 /// send cleanup events over (and potentially reconnect) the dead session.
 #[derive(Debug)]
 pub(crate) enum MousehopConnectionEvent {
+    StateChanged {
+        handle: ClientHandle,
+        session: ConnectionSession,
+    },
     Received {
         handle: ClientHandle,
         addr: SocketAddr,
         session: ConnectionSession,
         event: ProtoEvent,
+        receipt: Option<crate::transport::Receipt>,
     },
     Disconnected {
         handle: ClientHandle,
@@ -114,7 +122,11 @@ pub(crate) enum MousehopConnectionEvent {
 /// may affect connection or input state. The caller still validates the
 /// hello's magic and rejects a foreign value.
 pub(crate) fn handshake_allows_event(hello_ok: bool, event: &ProtoEvent) -> bool {
-    hello_ok || matches!(event, ProtoEvent::Hello { .. })
+    hello_ok
+        || matches!(
+            event,
+            ProtoEvent::Hello { .. } | ProtoEvent::ApprovalRevoked
+        )
 }
 
 /// Cleanup already committed to an exact transport generation must remain
@@ -207,6 +219,8 @@ fn record_retry_failure(
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
+    expected_fingerprint: Option<String>,
+    nonce: u64,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, MousehopConnectionError)> {
     log::info!("connecting to {addr} ...");
     // Bind family must match the target's: a 0.0.0.0 socket fails
@@ -227,16 +241,71 @@ async fn connect(
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
         insecure_skip_verify: true,
+        // Self-signed certificates use an explicit identity pin, not a CA.
+        verify_peer_certificate: expected_fingerprint.map(|expected| {
+            Arc::new(
+                move |certs: &[Vec<u8>], _: &[rustls::pki_types::CertificateDer<'static>]| {
+                    verify_pinned_certificate(certs, &expected)
+                },
+            ) as _
+        }),
         extended_master_secret: ExtendedMasterSecretType::Require,
         ..Default::default()
     };
     let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
     tokio::select! {
         _ = timeout => Err((addr, MousehopConnectionError::Timeout)),
-        result = DTLSConn::new(conn, config, true, None) => match result {
-            Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
+        result = DTLSConn::new(conn, config.clone(), true, None) => match result {
+            Ok(dtls_conn) => {
+                // Admission bytes never enter the input transport. A new input
+                // handshake follows only after the receiver durably authorizes.
+                let nonce = nonce.max(1);
+                let request = crate::approval::frame(nonce, crate::approval::Decision::Pending);
+                dtls_conn.send(&request[..16]).await.map_err(|e| (addr,e.into()))?;
+                let mut response = [0u8;32];
+                let result = tokio::time::timeout(crate::approval::TIMEOUT, async {
+                    loop {
+                        let n = dtls_conn.recv(&mut response).await?;
+                        if n != 17 || response[..16] != request[..16] { return Err(webrtc_util::Error::Other("invalid admission response".into())); }
+                        match crate::approval::Decision::decode(response[16]) {
+                            Some(crate::approval::Decision::Pending) => continue,
+                            Some(crate::approval::Decision::Approved) => return Ok(true),
+                            _ => return Ok(false),
+                        }
+                    }
+                }).await;
+                match result {
+                    Ok(Ok(true)) => {
+                        let _ = dtls_conn.close().await;
+                        let socket = Arc::new(UdpSocket::bind(bind_addr).await.map_err(|e| (addr,e.into()))?);
+                        socket.connect(addr).await.map_err(|e| (addr,e.into()))?;
+                        let input = tokio::time::timeout(DEFAULT_CONNECTION_TIMEOUT, DTLSConn::new(socket, config, true, None)).await
+                            .map_err(|_| (addr,MousehopConnectionError::Timeout))?
+                            .map_err(|e| (addr,e.into()))?;
+                        input.send(&request[..16]).await.map_err(|e| (addr,e.into()))?;
+                        let n = tokio::time::timeout(DEFAULT_CONNECTION_TIMEOUT,input.recv(&mut response)).await
+                            .map_err(|_| (addr,MousehopConnectionError::Timeout))?
+                            .map_err(|e| (addr,e.into()))?;
+                        if n != 17 || response[..16] != request[..16] || response[16] != 3 {
+                            let _ = input.close().await;
+                            return Err((addr,MousehopConnectionError::ApprovalPaused));
+                        }
+                        Ok((Arc::new(input),addr))
+                    },
+                    Ok(Err(_)) => { let _ = dtls_conn.close().await; Err((addr,MousehopConnectionError::NotConnected)) },
+                    _ => { let _ = dtls_conn.close().await; Err((addr,MousehopConnectionError::ApprovalPaused)) }
+                }
+            },
             Err(e) => Err((addr, e.into())),
         }
+    }
+}
+
+fn verify_pinned_certificate(certs: &[Vec<u8>], expected: &str) -> Result<(), webrtc_dtls::Error> {
+    if certs.len() == 1 && crate::crypto::generate_fingerprint(&certs[0]) == expected {
+        Ok(())
+    } else {
+        Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
     }
 }
 
@@ -251,15 +320,23 @@ async fn connect_any(
     addrs: &[SocketAddr],
     preferred: Option<SocketAddr>,
     cert: Certificate,
+    expected_fingerprint: Option<String>,
+    nonce: u64,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), MousehopConnectionError> {
     let mut joinset = JoinSet::new();
+    let mut approval_paused = false;
     if let Some(p) = preferred {
         // Dial the peer's mDNS-advertised primary first. If it
         // handshakes within `PREFERRED_ADDR_HEAD_START` we're done
         // before the others even start — the dialer biases toward
         // the OS-preferred interface (Mac service order, Linux
         // default route) without relying on RTT racing alone.
-        joinset.spawn_local(connect(p, cert.clone()));
+        joinset.spawn_local(connect(
+            p,
+            cert.clone(),
+            expected_fingerprint.clone(),
+            nonce,
+        ));
         let head_start = tokio::time::sleep(PREFERRED_ADDR_HEAD_START);
         tokio::pin!(head_start);
         loop {
@@ -267,6 +344,7 @@ async fn connect_any(
                 _ = &mut head_start => break,
                 Some(r) = joinset.join_next() => match r.expect("join error") {
                     Ok(conn) => return Ok(conn),
+                    Err((_, MousehopConnectionError::ApprovalPaused)) => { approval_paused = true; },
                     Err((a, e)) => log::warn!("failed to connect to {a}: `{e}`"),
                 },
             }
@@ -277,13 +355,27 @@ async fn connect_any(
             // already racing; don't dial the same socket twice
             continue;
         }
-        joinset.spawn_local(connect(addr, cert.clone()));
+        joinset.spawn_local(connect(
+            addr,
+            cert.clone(),
+            expected_fingerprint.clone(),
+            nonce,
+        ));
     }
     loop {
         match joinset.join_next().await {
-            None => return Err(MousehopConnectionError::NotConnected),
+            None => {
+                return Err(if approval_paused {
+                    MousehopConnectionError::ApprovalPaused
+                } else {
+                    MousehopConnectionError::NotConnected
+                });
+            }
             Some(r) => match r.expect("join error") {
                 Ok(conn) => return Ok(conn),
+                Err((_, MousehopConnectionError::ApprovalPaused)) => {
+                    approval_paused = true;
+                }
                 Err((a, e)) => {
                     log::warn!("failed to connect to {a}: `{e}`")
                 }
@@ -293,6 +385,7 @@ async fn connect_any(
 }
 
 pub(crate) struct MousehopConnection {
+    kcp_timeouts: crate::transport::Timeouts,
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, ConnectionSlot>>>,
@@ -326,14 +419,46 @@ pub(crate) struct MousehopConnection {
 }
 
 impl MousehopConnection {
+    pub(crate) fn screen_alignment(&self, handle: ClientHandle) -> mousehop_ipc::ScreenAlignment {
+        self.client_manager
+            .get_state(handle)
+            .map(|(c, _)| c.alignment)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn peer_display_size(&self, handle: ClientHandle) -> Option<(u32, u32)> {
+        self.current_session(handle)?;
+        self.client_manager.get_state(handle)?.1.display_size
+    }
+
+    pub(crate) fn update_peer_display_size(
+        &self,
+        handle: ClientHandle,
+        session: ConnectionSession,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if !self.sessions.is_current(handle, session)
+            || width == 0
+            || height == 0
+            || width > i32::MAX as u32
+            || height > i32::MAX as u32
+        {
+            return false;
+        }
+        self.client_manager
+            .set_display_size(handle, (width, height))
+    }
     pub(crate) fn new(
         cert: Certificate,
         client_manager: ClientManager,
         primary_hints: PrimaryCache,
+        kcp_timeouts: crate::transport::Timeouts,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
             cert,
+            kcp_timeouts,
             client_manager,
             conns: Default::default(),
             sessions: Default::default(),
@@ -365,7 +490,8 @@ impl MousehopConnection {
                     }
                     MousehopConnectionEvent::Disconnected {
                         handle, session, ..
-                    } => self
+                    }
+                    | MousehopConnectionEvent::StateChanged { handle, session } => self
                         .sessions
                         .current(*handle)
                         .is_none_or(|current| current == *session),
@@ -380,9 +506,89 @@ impl MousehopConnection {
     /// Return the authenticated transport generation currently selected for
     /// `handle`. Capture pins a handover and every Ack-gated input event to
     /// this value so a reconnect cannot inherit an in-flight crossing.
+    /// One-shot handoff for an exact established session, never a dial token.
+    /// The fingerprint is observed on DTLS, not copied from discovery or a pin.
+    #[allow(dead_code)]
+    pub(crate) async fn take_clipboard_lane(
+        &self,
+        handle: ClientHandle,
+        session: ConnectionSession,
+    ) -> Option<(String, Arc<crate::transport::ClipboardLane>)> {
+        let conns = self.conns.lock().await;
+        if !self.sessions.is_current(handle, session) {
+            return None;
+        }
+        let slot = conns
+            .values()
+            .find(|slot| slot.handle == handle && slot.session == session)?;
+        let lane = crate::transport::clipboard_lane(&slot.conn)?;
+        Some((slot.fingerprint.clone(), lane))
+    }
+
+    /// Terminal local revoke; regrant requires a fresh authenticated connection.
+    #[allow(dead_code)]
+    pub(crate) async fn revoke_clipboard_lane(
+        &self,
+        handle: ClientHandle,
+        session: ConnectionSession,
+    ) {
+        let conns = self.conns.lock().await;
+        for slot in conns
+            .values()
+            .filter(|slot| slot.handle == handle && slot.session == session)
+        {
+            crate::transport::invalidate_clipboard(&slot.conn);
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) async fn clipboard_snapshot(&self) -> Vec<(String, ConnectionSession, ArcConn)> {
+        self.conns
+            .lock()
+            .await
+            .values()
+            .filter(|slot| self.sessions.is_current(slot.handle, slot.session))
+            .take(crate::service::MAX_CLIPBOARD_PEERS)
+            .map(|slot| (slot.fingerprint.clone(), slot.session, slot.conn.clone()))
+            .collect()
+    }
+
     pub(crate) fn current_session(&self, handle: ClientHandle) -> Option<ConnectionSession> {
         self.client_manager.active_addr(handle)?;
         self.sessions.current(handle)
+    }
+
+    pub(crate) async fn recovery_links(
+        &self,
+    ) -> Vec<(
+        ClientHandle,
+        ConnectionSession,
+        Arc<crate::transport::lifecycle::Link>,
+    )> {
+        self.conns
+            .lock()
+            .await
+            .values()
+            .filter_map(|slot| {
+                crate::transport::lifecycle(&slot.conn)
+                    .filter(|link| link.enabled())
+                    .map(|link| (slot.handle, slot.session, link))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn recovery_link(
+        &self,
+        handle: ClientHandle,
+        session: ConnectionSession,
+    ) -> Option<Arc<crate::transport::lifecycle::Link>> {
+        self.conns
+            .lock()
+            .await
+            .values()
+            .find(|slot| slot.handle == handle && slot.session == session)
+            .and_then(|slot| crate::transport::lifecycle(&slot.conn))
+            .filter(|link| link.enabled())
     }
 
     /// Cheap send-only handle that shares all the dialer state with
@@ -394,6 +600,7 @@ impl MousehopConnection {
         let (_, dead_rx) = channel();
         Self {
             cert: self.cert.clone(),
+            kcp_timeouts: self.kcp_timeouts,
             client_manager: self.client_manager.clone(),
             conns: self.conns.clone(),
             sessions: self.sessions.clone(),
@@ -461,6 +668,9 @@ impl MousehopConnection {
                 if !self.client_manager.alive(handle) && !send_when_emulation_inactive {
                     return Err(MousehopConnectionError::TargetEmulationDisabled);
                 }
+                if !crate::transport::ready(&slot.conn) {
+                    return Err(MousehopConnectionError::NotConnected);
+                }
                 match slot.conn.send(buf).await {
                     Ok(_) => {}
                     Err(e) => {
@@ -517,6 +727,7 @@ impl MousehopConnection {
                 self.ping_sent_at.clone(),
                 self.primary_hints.clone(),
                 self.retry_state.clone(),
+                self.kcp_timeouts,
             ));
         }
         Err(MousehopConnectionError::NotConnected)
@@ -584,6 +795,9 @@ impl MousehopConnection {
         }
         if !self.client_manager.alive(handle) && !send_when_emulation_inactive && !session_cleanup {
             return Err(MousehopConnectionError::TargetEmulationDisabled);
+        }
+        if !crate::transport::ready(&slot.conn) {
+            return Err(MousehopConnectionError::NotConnected);
         }
         if let Err(e) = slot.conn.send(buf).await {
             log::warn!("client {handle} session {session} failed to send: {e}");
@@ -659,6 +873,13 @@ impl MousehopConnection {
     /// Otherwise returns false; the caller treats this as "still in
     /// cooldown, keep returning NotConnected silently."
     fn should_attempt(&self, handle: ClientHandle) -> bool {
+        if self
+            .client_manager
+            .get_state(handle)
+            .is_none_or(|(c, _)| c.approval_paused)
+        {
+            return false;
+        }
         let ips = self.client_manager.get_ips(handle).unwrap_or_default();
         let primary = self.client_manager.get_hostname(handle).and_then(|h| {
             let key = normalize_mdns_name(&h);
@@ -714,8 +935,14 @@ async fn connect_to_handle(
     ping_sent_at: Rc<RefCell<HashMap<(SocketAddr, ConnectionSession), Instant>>>,
     primary_hints: PrimaryCache,
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
+    kcp_timeouts: crate::transport::Timeouts,
 ) -> Result<(), MousehopConnectionError> {
     log::info!("client {handle} connecting ...");
+    if !sessions.is_current(handle, session) || client_manager.get_state(handle).is_none() {
+        return Err(MousehopConnectionError::NotConnected);
+    }
+    client_manager.set_transport_status(handle, "Negotiating");
+    let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
     // sending did not work, figure out active conn.
     if let Some(ips_set) = client_manager.get_ips(handle) {
         let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
@@ -766,17 +993,46 @@ async fn connect_to_handle(
             // event — `should_attempt` will keep gating until either
             // the backoff elapses or new info arrives.
             record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
+            if sessions.is_current(handle, session) {
+                client_manager.set_transport_status(handle, "Failed: no peer address");
+                let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
+            }
             finish_failed_dial(&connecting, &sessions, handle, session).await;
             return Err(MousehopConnectionError::NotConnected);
         }
-        let res = connect_any(&addrs, preferred, cert).await;
+        let res = connect_any(
+            &addrs,
+            preferred,
+            cert,
+            client_manager.expected_fingerprint(handle),
+            client_manager
+                .get_state(handle)
+                .map(|(c, _)| c.approval_nonce)
+                .unwrap_or(0),
+        )
+        .await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
+                if sessions.is_current(handle, session) {
+                    if matches!(e, MousehopConnectionError::ApprovalPaused) {
+                        if let Some((mut config, _)) = client_manager.get_state(handle) {
+                            config.approval_paused = true;
+                            client_manager.set_config(handle, config);
+                        }
+                    }
+                    client_manager.set_transport_status(handle, &format!("Failed: {e}"));
+                    let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
+                }
                 record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
                 finish_failed_dial(&connecting, &sessions, handle, session).await;
                 return Err(e);
             }
+        };
+        let Some(fingerprint) = crate::transport::authenticated_fingerprint(&conn).await else {
+            finish_failed_dial(&connecting, &sessions, handle, session).await;
+            let _ = conn.close().await;
+            return Err(MousehopConnectionError::NotConnected);
         };
         let mut conns_guard = conns.lock().await;
         if !sessions.is_current(handle, session) || client_manager.get_state(handle).is_none() {
@@ -788,6 +1044,19 @@ async fn connect_to_handle(
             );
             return Err(MousehopConnectionError::NotConnected);
         }
+        let use_kcp = client_manager
+            .get_state(handle)
+            .is_some_and(|(c, _)| c.use_kcp);
+        let mode = if use_kcp {
+            crate::transport::InputTransport::KcpRequired
+        } else {
+            crate::transport::InputTransport::Legacy
+        };
+        let conn = if cfg!(any(target_os = "macos", target_os = "windows")) {
+            crate::transport::attach_recoverable(conn, Some(mode), kcp_timeouts)
+        } else {
+            crate::transport::attach(conn, Some(mode), kcp_timeouts)
+        };
         log::info!("client ({handle}) connected @ {addr}");
         // `alive` belongs to the authenticated protocol session, not merely
         // this client handle. A reconnect can otherwise inherit `true` from
@@ -795,16 +1064,22 @@ async fn connect_to_handle(
         // completed Hello/Pong validation.
         client_manager.set_alive(handle, false);
         client_manager.set_active_addr(handle, Some(addr));
+        // Fence the old application lane before publishing its replacement.
+        if let Some(old) = conns_guard.get(&addr) {
+            crate::transport::invalidate_clipboard(&old.conn);
+        }
         let replaced = conns_guard.insert(
             addr,
             ConnectionSlot {
                 handle,
                 session,
+                fingerprint,
                 conn: conn.clone(),
             },
         );
         drop(conns_guard);
         if let Some(replaced) = replaced {
+            crate::transport::invalidate_clipboard(&replaced.conn);
             ping_response.borrow_mut().remove(&(addr, replaced.session));
             ping_sent_at.borrow_mut().remove(&(addr, replaced.session));
             log::info!(
@@ -837,7 +1112,15 @@ async fn connect_to_handle(
         // echoed Hello validates; `hello_handshake` retransmits until
         // then and tears the connection down if the window elapses.
         let hello_ok = Rc::new(Cell::new(false));
-        spawn_local(hello_handshake(addr, conn.clone(), hello_ok.clone()));
+        let scroll_inertia = client_manager
+            .get_state(handle)
+            .is_some_and(|(config, _)| config.scroll_inertia);
+        spawn_local(hello_handshake(
+            addr,
+            conn.clone(),
+            hello_ok.clone(),
+            scroll_inertia,
+        ));
 
         // poll connection for active
         spawn_local(ping_pong(
@@ -893,8 +1176,15 @@ async fn hello_handshake(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     hello_ok: Rc<Cell<bool>>,
+    scroll_inertia: bool,
 ) {
-    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::hello(local_commit()).into();
+    let mut hello = ProtoEvent::hello(local_commit());
+    if let ProtoEvent::Hello { capabilities, .. } = &mut hello {
+        if scroll_inertia {
+            *capabilities |= mousehop_proto::CAP_SCROLL_INERTIA_REQUEST;
+        }
+    }
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = hello.into();
     for _ in 0..HELLO_MAX_ATTEMPTS {
         if hello_ok.get() {
             return;
@@ -996,7 +1286,16 @@ async fn ping_pong(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        if !ping_response.borrow_mut().remove(&(addr, session)) {
+        let pong_received = ping_response.borrow_mut().remove(&(addr, session));
+        // Established KCP sessions have one configurable liveness owner in the
+        // transport. Keep probing for RTT/availability, without the legacy
+        // fixed 2s watchdog overriding kcp_peer_timeout_ms.
+        if !pong_received
+            && !matches!(
+                crate::transport::status(&conn).as_str(),
+                "KCP" | "Recovering"
+            )
+        {
             log::warn!("{addr} did not respond, closing connection");
             disconnect(
                 &client_manager,
@@ -1038,6 +1337,7 @@ async fn receive_loop(
         if n == 0 {
             continue;
         }
+        let receipt = crate::transport::receipt(&conn);
         let datagram = &buf[..n];
         let event = match decode_proto_datagram(datagram) {
             Some(event) => event,
@@ -1062,9 +1362,35 @@ async fn receive_loop(
             continue;
         }
         match event {
+            ProtoEvent::ApprovalRevoked => {
+                if sessions.is_current(handle, session) {
+                    if let Some((mut config, _)) = client_manager.get_state(handle) {
+                        config.approval_paused = true;
+                        client_manager.set_config(handle, config);
+                    }
+                    client_manager.set_transport_status(
+                        handle,
+                        "Failed: approval revoked; explicitly request again",
+                    );
+                    let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
+                }
+                break;
+            }
             ProtoEvent::Pong(b) => {
                 client_manager.set_active_addr(handle, Some(addr));
-                client_manager.set_alive(handle, b);
+                client_manager.set_alive(handle, b && crate::transport::ready(&conn));
+                let status = if b {
+                    crate::transport::status(&conn)
+                } else {
+                    "Negotiating".to_owned()
+                };
+                if client_manager
+                    .get_state(handle)
+                    .is_some_and(|(_, s)| s.transport_status != status)
+                {
+                    client_manager.set_transport_status(handle, &status);
+                    let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
+                }
                 ping_response.borrow_mut().insert((addr, session));
                 // Live RTT of the active connection over the real DTLS
                 // path — accurate and firewall-proof (unlike the TCP
@@ -1100,6 +1426,7 @@ async fn receive_loop(
                     handle,
                     addr,
                     session,
+                    receipt,
                     event: ProtoEvent::Hello {
                         magic,
                         commit,
@@ -1114,11 +1441,28 @@ async fn receive_loop(
                     addr,
                     session,
                     event,
+                    receipt,
                 })
                 .expect("channel closed"),
         }
     }
     log::debug!("{addr}: receive loop ended");
+    if connection_is_current(&conns, &sessions, handle, addr, session).await {
+        let status = crate::transport::status(&conn);
+        client_manager.set_transport_status(
+            handle,
+            if client_manager
+                .get_state(handle)
+                .is_some_and(|(c, _)| c.approval_paused)
+            {
+                "Failed: approval revoked; explicitly request again"
+            } else if status.starts_with("Failed:") {
+                &status
+            } else {
+                "Disconnected"
+            },
+        );
+    }
     disconnect(
         &client_manager,
         handle,
@@ -1180,6 +1524,7 @@ async fn disconnect(
     let mut conns = conns.lock().await;
     let removed = match conns.get(&addr) {
         Some(slot) if slot.handle == handle && slot.session == session => {
+            crate::transport::invalidate_clipboard(&slot.conn);
             conns.remove(&addr).map(|slot| slot.conn)
         }
         Some(_) => {
@@ -1201,6 +1546,15 @@ async fn disconnect(
         && (manager_removed || client_manager.active_addr(handle) == Some(addr))
     {
         if !manager_removed {
+            let status = removed.as_ref().map(crate::transport::status);
+            if let Some(status) = status.filter(|s| s.starts_with("Failed:")) {
+                client_manager.set_transport_status(handle, &status);
+            } else if !client_manager
+                .get_state(handle)
+                .is_some_and(|(_, s)| s.transport_status.starts_with("Failed:"))
+            {
+                client_manager.set_transport_status(handle, "Disconnected");
+            }
             client_manager.set_alive(handle, false);
             client_manager.set_active_addr(handle, None);
             client_manager.set_peer_commit(handle, None);
@@ -1225,6 +1579,16 @@ fn clear_session_ping_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_pin_requires_one_exact_certificate() {
+        let cert = b"test certificate".to_vec();
+        let expected = crate::crypto::generate_fingerprint(&cert);
+        assert!(verify_pinned_certificate(std::slice::from_ref(&cert), &expected).is_ok());
+        assert!(verify_pinned_certificate(&[b"replacement".to_vec()], &expected).is_err());
+        assert!(verify_pinned_certificate(&[], &expected).is_err());
+        assert!(verify_pinned_certificate(&[cert.clone(), cert], &expected).is_err());
+    }
     use input_event::{Event, KeyboardEvent, PointerEvent, display::DisplayLayout};
 
     fn connection_map() -> Mutex<HashMap<SocketAddr, ConnectionSlot>> {
@@ -1342,6 +1706,7 @@ mod tests {
             ConnectionSlot {
                 handle,
                 session,
+                fingerprint: "test-peer".into(),
                 conn: current.clone(),
             },
         );
@@ -1444,6 +1809,7 @@ mod tests {
             ConnectionSlot {
                 handle,
                 session: replacement_session,
+                fingerprint: "test-peer".into(),
                 conn: replacement.clone(),
             },
         );
@@ -1511,6 +1877,7 @@ mod tests {
             ConnectionSlot {
                 handle,
                 session: current_session,
+                fingerprint: "test-peer".into(),
                 conn: current_conn,
             },
         );
@@ -1534,6 +1901,7 @@ mod tests {
             ConnectionSlot {
                 handle,
                 session,
+                fingerprint: "test-peer".into(),
                 conn: current.clone(),
             },
         );
@@ -1580,8 +1948,12 @@ mod tests {
         let handle = client_manager.add_client();
         let cert = Certificate::generate_self_signed(["mousehop-dial-reset-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            client_manager.clone(),
+            PrimaryCache::default(),
+            Default::default(),
+        );
         let session = connection.sessions.allocate(handle);
         connection.connecting.lock().await.insert(handle, session);
 
@@ -1610,14 +1982,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clipboard_handoff_binds_observed_identity_exact_session_and_revocation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                let cert = Certificate::generate_self_signed(["clipboard-owner".into()]).unwrap();
+                let owner = MousehopConnection::new(
+                    cert,
+                    clients,
+                    PrimaryCache::default(),
+                    crate::transport::Timeouts::default(),
+                );
+                let addr = "127.0.0.1:4242".parse().unwrap();
+                let old = owner.sessions.allocate(handle);
+                let conn = crate::transport::attach_recoverable(
+                    test_conn().await,
+                    Some(crate::transport::InputTransport::KcpRequired),
+                    crate::transport::Timeouts::default(),
+                );
+                owner.conns.lock().await.insert(
+                    addr,
+                    ConnectionSlot {
+                        handle,
+                        session: old,
+                        fingerprint: "observed-not-expected-pin".into(),
+                        conn: conn.clone(),
+                    },
+                );
+                assert!(owner.take_clipboard_lane(handle, old + 1).await.is_none());
+                let (fp, lane) = owner.take_clipboard_lane(handle, old).await.unwrap();
+                assert_eq!(fp, "observed-not-expected-pin");
+                assert!(owner.take_clipboard_lane(handle, old).await.is_none());
+                owner.revoke_clipboard_lane(handle, old + 1).await;
+                assert_eq!(lane.try_receive(), Ok(None));
+                owner.revoke_clipboard_lane(handle, old).await;
+                assert_eq!(
+                    lane.try_receive(),
+                    Err(crate::transport::ClipboardError::Closed)
+                );
+                let new = owner.sessions.allocate(handle);
+                let replacement = crate::transport::attach_recoverable(
+                    test_conn().await,
+                    Some(crate::transport::InputTransport::KcpRequired),
+                    crate::transport::Timeouts::default(),
+                );
+                owner.conns.lock().await.insert(
+                    addr,
+                    ConnectionSlot {
+                        handle,
+                        session: new,
+                        fingerprint: "new-observed-peer".into(),
+                        conn: replacement.clone(),
+                    },
+                );
+                assert!(owner.take_clipboard_lane(handle, old).await.is_none());
+                let (fp, fresh) = owner.take_clipboard_lane(handle, new).await.unwrap();
+                assert_eq!(fp, "new-observed-peer");
+                owner.revoke_clipboard_lane(handle, old).await;
+                assert_eq!(fresh.try_receive(), Ok(None));
+                conn.close().await.unwrap();
+                replacement.close().await.unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn session_pinned_send_never_falls_through_to_replacement() {
         let client_manager = ClientManager::default();
         let handle = client_manager.add_client();
         let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
         let cert = Certificate::generate_self_signed(["mousehop-session-send-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            client_manager.clone(),
+            PrimaryCache::default(),
+            Default::default(),
+        );
         let old_session = connection.sessions.allocate(handle);
         let replacement_session = connection.sessions.allocate(handle);
         connection.conns.lock().await.insert(
@@ -1625,6 +2067,7 @@ mod tests {
             ConnectionSlot {
                 handle,
                 session: replacement_session,
+                fingerprint: "test-peer".into(),
                 conn: test_conn().await,
             },
         );
@@ -1649,8 +2092,12 @@ mod tests {
         let handle = client_manager.add_client();
         let cert = Certificate::generate_self_signed(["mousehop-release-cleanup-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            client_manager.clone(),
+            PrimaryCache::default(),
+            Default::default(),
+        );
         let session = connection.sessions.allocate(handle);
         let (conn, receiver, addr) = connected_test_conn().await;
         connection.conns.lock().await.insert(
@@ -1658,6 +2105,7 @@ mod tests {
             ConnectionSlot {
                 handle,
                 session,
+                fingerprint: "test-peer".into(),
                 conn,
             },
         );

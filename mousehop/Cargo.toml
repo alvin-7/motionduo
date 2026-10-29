@@ -4,7 +4,7 @@ description = "Software KVM Switch / mouse & keyboard sharing software for Local
 version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/jondkinney/mousehop"
+repository = "https://github.com/alvin-7/motionduo"
 include = [
     "src/**/*",
     "build.rs",
@@ -13,17 +13,24 @@ include = [
     # so they must ship in the published crate.
     "com.mousehop.Mousehop.desktop",
     "assets/com.mousehop.Mousehop.svg",
+    "assets/mousehop.ico",
 ]
+
+[[bin]]
+name = "motionduo"
+path = "src/main.rs"
 
 [build-dependencies]
 shadow-rs = "1.2.0"
+winresource = "0.1.31"
 
 [dependencies]
-input-event = { workspace = true }
+kcp = "=0.6.0"
+async-trait = "0.1"
+input-event = { workspace = true, features = ["clipboard-png"] }
 input-emulation = { workspace = true, default-features = false }
 input-capture = { workspace = true, default-features = false }
 mousehop-cli = { workspace = true }
-mousehop-gtk = { workspace = true, optional = true }
 mousehop-ipc = { workspace = true }
 mousehop-proto = { workspace = true }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
@@ -84,7 +91,6 @@ core-graphics = { version = "0.25.0", features = ["highsierra"] }
 
 [features]
 default = [
-    "gtk",
     "layer_shell_capture",
     "x11_capture",
     "libei_capture",
@@ -92,8 +98,9 @@ default = [
     "libei_emulation",
     "rdp_emulation",
     "x11_emulation",
+    "clipboard-image",
 ]
-gtk = ["dep:mousehop-gtk"]
+clipboard-image = ["input-capture/clipboard-image", "input-emulation/clipboard-image"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
@@ -101,20 +108,3 @@ libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]
 x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
-
-[package.metadata.bundle]
-name = "Mousehop"
-# `target/` and `build-aux/` live at the workspace root. cargo-bundle
-# resolves these globs from the *current working directory* (not the
-# manifest), so the release workflow must `cd mousehop && cargo bundle`
-# — otherwise the icon, menu-bar template, and LSUIElement / TCC
-# usage-description plist are silently dropped from the .app.
-#
-# The `resources` glob's `..` segment is then rewritten to `_up_` by
-# cargo-bundle's resource_relpath, so `menubar-template.png` lands at
-# `Resources/_up_/target/...`. `scripts/copy-macos-dylib.sh` flattens
-# it back to the Resources root so NSBundle pathForResource: finds it.
-icon = ["../target/icon.icns"]
-identifier = "com.mousehop.Mousehop"
-osx_info_plist_exts = ["../build-aux/macos-lsui-element.plist"]
-resources = ["../target/menubar-template.png"]

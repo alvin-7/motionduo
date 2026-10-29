@@ -1,9 +1,207 @@
+#[cfg(all(feature = "clipboard-image", any(windows, target_os = "macos")))]
+#[path = "clipboard_image.rs"]
+pub mod image;
+
+#[cfg(all(feature = "clipboard-image", any(target_os = "macos", test)))]
+#[path = "clipboard_file_image.rs"]
+mod file_image;
+
 use arboard::Clipboard;
 use input_event::{ClipboardEvent, Event};
 use mousehop_ipc::AppIdent;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Maximum text payload admitted by the native capture adapter.
+/// This matches the wire offer limit; native APIs may still allocate before
+/// returning, so this is an admission bound rather than an allocation proof.
+pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
+const ECHO_ENTRIES: usize = 2;
+const ECHO_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardFormat {
+    Text,
+    Png,
+}
+
+/// A bounded native sample with the OS change counter captured alongside it.
+/// The generation is provenance only: other applications can mutate the
+/// clipboard without going through Mousehop and may race a sample.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardSample {
+    pub native_generation: u64,
+    pub format: ClipboardFormat,
+    pub bytes: Vec<u8>,
+    /// Windows provenance read alongside the payload under one clipboard lock.
+    /// Absence is normal for external copies, but cannot authorize echo matching.
+    #[cfg(windows)]
+    pub windows_provenance: Option<WindowsProvenance>,
+}
+
+/// Native format and opaque source marker; neither is authentication of a peer.
+#[cfg(windows)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct WindowsProvenance {
+    pub native_format: u32,
+    pub marker: [u8; 32],
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for WindowsProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsProvenance")
+            .field("native_format", &self.native_format)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Bounded shared echo hints for text and PNG. Registration is not proof that
+/// Mousehop owns a generation: a sequence counter observed after an OS write
+/// can already belong to an unrelated writer. Use only with independently
+/// established write provenance, never a guessed post-write generation.
+#[derive(Clone, Default)]
+pub struct EchoSuppression {
+    inner: Arc<Mutex<VecDeque<EchoEntry>>>,
+    #[cfg(target_os = "macos")]
+    mac_fence: Arc<Mutex<MacCaptureFence>>,
+}
+
+/// Application-level ownership fence: unlike byte matching, deliberately drops
+/// *all* samples at or before a registered write generation. A later local copy
+/// advances changeCount and is admitted even if it retained the custom type.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct MacCaptureFence {
+    through: Option<u64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacCaptureFence {
+    fn register(&mut self, generation: u64) -> bool {
+        // NSPasteboard uses a signed NSInteger. Refuse zero/negative/wrapped
+        // values rather than treating wrapping as evidence of a fresh copy.
+        if generation == 0 || generation > i64::MAX as u64 {
+            return false;
+        }
+        self.through = Some(self.through.map_or(generation, |old| old.max(generation)));
+        true
+    }
+
+    #[allow(dead_code)]
+    fn allows(&self, generation: u64) -> bool {
+        generation != 0
+            && generation <= i64::MAX as u64
+            && self.through.is_none_or(|through| generation > through)
+    }
+}
+
+struct EchoEntry {
+    sample: ClipboardSample,
+    inserted: Instant,
+}
+
+impl EchoSuppression {
+    /// Register the generation from a verified macOS ownership-taking receipt.
+    /// Call synchronously inside its existing lifecycle-guarded registration
+    /// callback, before releasing that guard. Never pass a post-write poll.
+    /// This is a conservative ownership fence, NOT marker/content atomicity:
+    /// every sample through this generation is dropped, including a same-owner
+    /// mutation. The fence has no TTL; a future ownership change remains usable.
+    /// Capture publication/revocation must share the caller's lifecycle fence.
+    #[cfg(target_os = "macos")]
+    pub fn register_macos_write_generation(&self, generation: u64) -> bool {
+        self.mac_fence
+            .try_lock()
+            .is_ok_and(|mut fence| fence.register(generation))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    pub(super) fn macos_generation_allows(&self, generation: u64) -> bool {
+        self.mac_fence
+            .try_lock()
+            .is_ok_and(|fence| fence.allows(generation))
+    }
+
+    /// Register independently verified native-write provenance, not an arbitrary
+    /// generation read after `set_checked`. Existing emulation APIs do not return
+    /// such a receipt. Returns false on oversize/unknown generation/contention.
+    /// At most two bounded payloads are retained for five seconds. Exact bytes
+    /// avoid hash collisions; a same-content external copy in a NEW generation
+    /// is never suppressed. Native generation wrap/reuse remains an OS limit.
+    pub fn register(&self, sample: ClipboardSample) -> bool {
+        if sample.native_generation == 0 || !sample_is_bounded(&sample) {
+            return false;
+        }
+        #[cfg(windows)]
+        if sample.windows_provenance.is_none() {
+            return false;
+        }
+        #[cfg(windows)]
+        if !sample
+            .windows_provenance
+            .as_ref()
+            .is_some_and(|source| match sample.format {
+                ClipboardFormat::Text => source.native_format == 13,
+                ClipboardFormat::Png => (0xc000..=0xffff).contains(&source.native_format),
+            })
+        {
+            return false;
+        }
+        let Ok(mut entries) = self.inner.try_lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        entries.retain(|entry| now.duration_since(entry.inserted) <= ECHO_TTL);
+        while entries.len() >= ECHO_ENTRIES {
+            entries.pop_front();
+        }
+        entries.push_back(EchoEntry {
+            sample,
+            inserted: now,
+        });
+        true
+    }
+
+    /// Test an exact generation/format/payload against retained write hints.
+    /// Contended or poisoned state conservatively suppresses the sample.
+    pub fn contains(&self, sample: &ClipboardSample) -> bool {
+        // Fail closed on contention or poisoned state, not by blocking capture.
+        let Ok(mut entries) = self.inner.try_lock() else {
+            return true;
+        };
+        let now = Instant::now();
+        entries.retain(|entry| now.duration_since(entry.inserted) <= ECHO_TTL);
+        entries.iter().any(|entry| entry.sample == *sample)
+    }
+}
+
+fn sample_is_bounded(sample: &ClipboardSample) -> bool {
+    let limit = match sample.format {
+        ClipboardFormat::Text => MAX_TEXT_BYTES,
+        ClipboardFormat::Png => 16 * 1024 * 1024,
+    };
+    !sample.bytes.is_empty() && sample.bytes.len() <= limit
+}
+
+#[cfg(windows)]
+fn native_generation() -> u64 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
+    }
+    unsafe { GetClipboardSequenceNumber() as u64 }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn native_generation() -> u64 {
+    use objc2_app_kit::NSPasteboard;
+    objc2::rc::autoreleasepool(|_| NSPasteboard::generalPasteboard().changeCount() as u64)
+}
+
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::spawn_blocking;
 use tokio::time::interval;
@@ -393,6 +591,128 @@ impl PollDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_fence_is_shared_nonblocking_and_fails_closed() {
+        let echo = EchoSuppression::default();
+        assert!(echo.register_macos_write_generation(41));
+        assert!(!echo.clone().macos_generation_allows(41));
+        assert!(echo.clone().macos_generation_allows(42));
+        let _guard = echo.mac_fence.lock().unwrap();
+        assert!(!echo.register_macos_write_generation(43));
+        assert!(!echo.macos_generation_allows(42));
+    }
+
+    #[test]
+    fn mac_fence_drops_remote_ownership_but_admits_next_local_copy() {
+        let mut fence = MacCaptureFence::default();
+        assert!(fence.allows(40));
+        assert!(fence.register(41));
+        assert!(!fence.allows(40)); // delayed worker, never republish old data
+        assert!(!fence.allows(41)); // same owner may mutate without changeCount
+        assert!(fence.allows(42)); // next local ownership, even retained marker
+        assert!(fence.register(43));
+        assert!(fence.register(41)); // reordered receipt cannot lower fence
+        assert!(!fence.allows(42));
+        assert!(!fence.allows(43));
+        assert!(fence.allows(44));
+        assert!(!fence.register(0));
+        assert!(!fence.register(u64::MAX));
+        assert!(!fence.allows(0));
+        assert!(!fence.allows(u64::MAX));
+        // No expiry: slow reads of our remote ownership cannot escape after TTL.
+        assert!(!fence.allows(43));
+    }
+
+    fn sample(generation: u64, format: ClipboardFormat, bytes: &[u8]) -> ClipboardSample {
+        ClipboardSample {
+            native_generation: generation,
+            format,
+            bytes: bytes.to_vec(),
+            #[cfg(windows)]
+            windows_provenance: Some(WindowsProvenance {
+                native_format: if format == ClipboardFormat::Text {
+                    13
+                } else {
+                    0xc001
+                },
+                marker: [7; 32],
+            }),
+        }
+    }
+
+    #[test]
+    fn echo_requires_exact_provenance_not_matching_external_content() {
+        let echo = EchoSuppression::default();
+        let written = sample(41, ClipboardFormat::Text, b"hello");
+        assert!(echo.register(written.clone()));
+        assert!(echo.contains(&written));
+        assert!(!echo.contains(&sample(42, ClipboardFormat::Text, b"hello")));
+        assert!(!echo.contains(&sample(41, ClipboardFormat::Text, b"other")));
+        assert!(!echo.contains(&sample(41, ClipboardFormat::Png, b"hello")));
+        assert!(!echo.register(sample(0, ClipboardFormat::Text, b"hello")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_echo_requires_marker_native_format_and_complete_receipt() {
+        let echo = EchoSuppression::default();
+        let written = sample(41, ClipboardFormat::Text, b"private");
+        assert!(echo.register(written.clone()));
+        for change in 0..5 {
+            let mut external = written.clone();
+            match change {
+                0 => external.windows_provenance = None,
+                1 => external.windows_provenance.as_mut().unwrap().marker[0] ^= 1,
+                2 => external.windows_provenance.as_mut().unwrap().native_format = 8,
+                3 => external.native_generation += 1,
+                _ => external.bytes.push(b'!'),
+            }
+            assert!(!echo.contains(&external));
+        }
+        let mut missing = written.clone();
+        missing.windows_provenance = None;
+        assert!(!echo.register(missing));
+        let mut wrong_format = written;
+        wrong_format
+            .windows_provenance
+            .as_mut()
+            .unwrap()
+            .native_format = 8;
+        assert!(!echo.register(wrong_format));
+    }
+
+    #[test]
+    fn echo_storage_is_bounded_shared_and_expiring() {
+        let echo = EchoSuppression::default();
+        for generation in 1..=3 {
+            assert!(echo.register(sample(generation, ClipboardFormat::Text, b"hello")));
+        }
+        assert_eq!(echo.inner.lock().unwrap().len(), ECHO_ENTRIES);
+        assert!(!echo.contains(&sample(1, ClipboardFormat::Text, b"hello")));
+        assert!(
+            echo.clone()
+                .contains(&sample(3, ClipboardFormat::Text, b"hello"))
+        );
+        for entry in echo.inner.lock().unwrap().iter_mut() {
+            entry.inserted = Instant::now() - ECHO_TTL - Duration::from_secs(1);
+        }
+        assert!(!echo.contains(&sample(3, ClipboardFormat::Text, b"hello")));
+        assert!(!echo.register(sample(
+            4,
+            ClipboardFormat::Text,
+            &vec![0; MAX_TEXT_BYTES + 1]
+        )));
+    }
+
+    #[test]
+    fn echo_contention_never_waits_and_fails_closed() {
+        let echo = EchoSuppression::default();
+        let _guard = echo.inner.lock().unwrap();
+        assert!(!echo.register(sample(2, ClipboardFormat::Text, b"hello")));
+        assert!(echo.contains(&sample(2, ClipboardFormat::Text, b"hello")));
+    }
 
     #[test]
     fn classify_unchanged_when_text_matches_last_content() {

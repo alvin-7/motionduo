@@ -25,19 +25,14 @@
 //! all browse/registration state — useful on networks where mDNS
 //! multicast (224.0.0.251) is firewalled.
 
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::HashMap, net::IpAddr, rc::Rc};
 
 use local_channel::mpsc::Sender;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use mousehop_ipc::IfaceKind;
+use mousehop_ipc::{DiscoveredDevice, IfaceKind};
 use tokio::task::{JoinHandle, spawn_local};
 
-use crate::network::{default_interface_kind, is_routable_ip, local_addresses_with_kind};
+use crate::network::{NetworkSnapshot, is_routable_ip};
 
 const SERVICE_TYPE: &str = "_mousehop._udp.local.";
 const TXT_PRIMARY_KEY: &str = "primary";
@@ -61,7 +56,10 @@ pub(crate) enum DiscoveryEvent {
         addresses: Vec<IpAddr>,
         /// Per-address interface kind from the peer's TXT record.
         interfaces: HashMap<IpAddr, IfaceKind>,
+        group: Option<String>,
+        device: Box<DiscoveredDevice>,
     },
+    Removed(String),
 }
 
 fn iface_kind_str(kind: IfaceKind) -> &'static str {
@@ -81,23 +79,24 @@ fn parse_iface_kind(s: &str) -> Option<IfaceKind> {
     }
 }
 
-/// Cross-platform: IP of the interface that owns the default route.
-///
-/// On macOS the default route reflects the user's service-order
-/// ranking — that's exactly the "primary" the user expects when they
-/// say "use Ethernet, not Wi-Fi". On Linux it reflects the lowest-
-/// metric default route. On Windows it's whatever
-/// `GetBestRoute2` selects.
-fn primary_ipv4() -> Option<Ipv4Addr> {
-    let iface = netdev::get_default_interface().ok()?;
-    iface.ipv4.first().map(|net| net.addr())
-}
-
 fn local_hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|s| s.into_string().ok())
         .unwrap_or_else(|| "mousehop".to_string())
+}
+
+pub(crate) fn local_device_name() -> String {
+    std::env::var("MOUSEHOP_DISCOVERY_NAME")
+        .ok()
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 63
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+        .unwrap_or_else(local_hostname)
 }
 
 /// Strip a single trailing dot if present. Bonjour hostnames are
@@ -186,6 +185,8 @@ pub(crate) struct Discovery {
     /// Sink for [`DiscoveryEvent`]s, drained by the service. Held so a
     /// re-enable (`set_enabled`) hands the fresh browse task a clone.
     event_tx: Sender<DiscoveryEvent>,
+    network: NetworkSnapshot,
+    identity: Option<(String, String)>,
 }
 
 impl Discovery {
@@ -201,10 +202,11 @@ impl Discovery {
         enabled: bool,
         primary_cache: PrimaryCache,
         event_tx: Sender<DiscoveryEvent>,
+        network: NetworkSnapshot,
     ) -> Self {
         if !enabled {
             log::info!("mdns discovery disabled by config");
-            return Self::inert(port, primary_cache, event_tx);
+            return Self::inert(port, primary_cache, event_tx, network);
         }
         match ServiceDaemon::new() {
             Ok(daemon) => {
@@ -216,18 +218,25 @@ impl Discovery {
                     browse_task,
                     port,
                     event_tx,
+                    network,
+                    identity: None,
                 };
                 this.register();
                 this
             }
             Err(e) => {
                 log::warn!("mdns ServiceDaemon::new failed: {e}; discovery disabled");
-                Self::inert(port, primary_cache, event_tx)
+                Self::inert(port, primary_cache, event_tx, network)
             }
         }
     }
 
-    fn inert(port: u16, primary_cache: PrimaryCache, event_tx: Sender<DiscoveryEvent>) -> Self {
+    fn inert(
+        port: u16,
+        primary_cache: PrimaryCache,
+        event_tx: Sender<DiscoveryEvent>,
+        network: NetworkSnapshot,
+    ) -> Self {
         Self {
             daemon: None,
             registered_fullname: None,
@@ -235,6 +244,8 @@ impl Discovery {
             browse_task: None,
             port,
             event_tx,
+            network,
+            identity: None,
         }
     }
 
@@ -245,16 +256,16 @@ impl Discovery {
         let Some(daemon) = self.daemon.as_ref() else {
             return;
         };
-        // Drop the old registration first so we don't leave stale
-        // TXT records floating on the network.
-        if let Some(old) = self.registered_fullname.take() {
-            let _ = daemon.unregister(&old);
-        }
-        let host = local_hostname();
+        // Isolated protocol tests must not collide with an installed app's
+        // service instance or hostname on the same physical computer.
+        let host = local_device_name();
         let host_record = format!("{host}.local.");
-        let primary = match primary_ipv4() {
+        let primary = match self.network.primary {
             Some(ip) => ip,
             None => {
+                if let Some(old) = self.registered_fullname.take() {
+                    let _ = daemon.unregister(&old);
+                }
                 log::warn!(
                     "mdns: no default-route interface; skipping registration (will retry on \
                      interface change)"
@@ -265,21 +276,16 @@ impl Discovery {
         // Advertise *every* physical-interface address (so a dual-homed
         // peer surfaces all of them via discovery, no hand-pinning),
         // each tagged with its interface kind in a `if_<ip>` TXT key.
-        let (mut addresses, mut kinds) = local_addresses_with_kind();
-        if !addresses.contains(&IpAddr::V4(primary)) {
-            addresses.push(IpAddr::V4(primary));
-        }
-        // The primary may live on an interface `local_addresses_with_kind`
-        // filtered out (e.g. a VPN tunnel routing the default), so it
-        // wouldn't otherwise get an `if_<ip>` label. Tag it with the
-        // default interface's kind (Other if unknown) so every
-        // advertised address is labeled.
-        kinds
-            .entry(IpAddr::V4(primary))
-            .or_insert_with(|| default_interface_kind().unwrap_or(IfaceKind::Other));
+        let addresses = &self.network.addresses;
+        let kinds = &self.network.kinds;
         let mut props = HashMap::new();
         props.insert(TXT_PRIMARY_KEY.to_string(), primary.to_string());
-        for (ip, kind) in &kinds {
+        if let Some((group, fingerprint)) = &self.identity {
+            props.insert("group".into(), group.clone());
+            props.insert("fingerprint".into(), fingerprint.clone());
+            props.insert("platform".into(), std::env::consts::OS.into());
+        }
+        for (ip, kind) in kinds {
             props.insert(
                 format!("{TXT_IFACE_PREFIX}{ip}"),
                 iface_kind_str(*kind).to_string(),
@@ -300,6 +306,13 @@ impl Discovery {
             }
         };
         let fullname = info.get_fullname().to_string();
+        if let Some(old) = self.registered_fullname.take() {
+            // Updating TXT/IP records must not send a goodbye for the same
+            // service: its delayed retransmission can evict the new records.
+            if old != fullname {
+                let _ = daemon.unregister(&old);
+            }
+        }
         match daemon.register(info) {
             Ok(()) => {
                 log::info!(
@@ -316,8 +329,10 @@ impl Discovery {
     /// by the service's main loop so the TXT record reflects the
     /// active default-route interface even when interface changes
     /// don't arrive through if-watch.
-    pub(crate) fn refresh(&mut self) {
-        if self.daemon.is_some() {
+    pub(crate) fn refresh(&mut self, network: NetworkSnapshot) {
+        let changed = self.network != network;
+        self.network = network;
+        if self.daemon.is_some() && (changed || self.registered_fullname.is_none()) {
             self.register();
         }
     }
@@ -328,7 +343,25 @@ impl Discovery {
             return;
         }
         self.port = port;
-        self.refresh();
+        self.register();
+    }
+
+    pub(crate) fn set_identity(&mut self, email: Option<&str>, fingerprint: &str) {
+        let identity =
+            email.map(|email| (crate::nearby::email_group(email), fingerprint.to_owned()));
+        if self.identity != identity {
+            self.identity = identity;
+            self.register();
+            // Restart browsing so changing the email also sees cached peers.
+            if let Some(task) = self.browse_task.take() {
+                task.abort();
+            }
+            if let Some(daemon) = &self.daemon {
+                let _ = daemon.stop_browse(SERVICE_TYPE);
+                self.browse_task =
+                    start_browse(daemon, self.primary_cache.clone(), self.event_tx.clone());
+            }
+        }
     }
 
     /// Toggle the subsystem on/off. Off → unregister, abort browse,
@@ -340,12 +373,16 @@ impl Discovery {
             return;
         }
         if enabled {
+            let identity = self.identity.clone();
             *self = Self::new(
                 self.port,
                 true,
                 self.primary_cache.clone(),
                 self.event_tx.clone(),
+                self.network.clone(),
             );
+            self.identity = identity;
+            self.register();
         } else {
             self.shutdown();
         }
@@ -433,6 +470,26 @@ fn start_browse(
                     );
                     let _ = event_tx.send(DiscoveryEvent::Resolved {
                         instance: key,
+                        device: Box::new(DiscoveredDevice {
+                            id: resolved.get_fullname().to_string(),
+                            name: instance.chars().take(128).collect(),
+                            hostname: target.chars().take(253).collect(),
+                            addresses: addresses.iter().take(32).copied().collect(),
+                            port: resolved.get_port(),
+                            fingerprint: resolved
+                                .get_property_val_str("fingerprint")
+                                .unwrap_or_default()
+                                .chars()
+                                .take(128)
+                                .collect(),
+                            platform: resolved
+                                .get_property_val_str("platform")
+                                .unwrap_or("unknown")
+                                .chars()
+                                .take(32)
+                                .collect(),
+                        }),
+                        group: resolved.get_property_val_str("group").map(str::to_owned),
                         addresses,
                         interfaces,
                     });
@@ -446,6 +503,9 @@ fn start_browse(
                     // wrong: if the peer comes back with a different
                     // primary, the next ServiceResolved overwrites.
                     log::debug!("mdns: service removed {fullname}");
+                    let key = normalize_mdns_name(instance_from_fullname(&fullname, SERVICE_TYPE));
+                    primary_cache.borrow_mut().remove(&key);
+                    let _ = event_tx.send(DiscoveryEvent::Removed(fullname));
                 }
                 _ => {}
             }

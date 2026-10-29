@@ -31,6 +31,7 @@ tokio-util = "0.7.11"
 arboard = { version = "3.4", features = ["wayland-data-control"] }
 mousehop-ipc = { workspace = true }
 serde_json = "1.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"], optional = true }
 
 
 [target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
@@ -83,6 +84,8 @@ windows = { version = "0.61.2", features = [
 
 [features]
 default = ["layer_shell", "x11", "libei"]
+# Explicit OS adapter API only; does not enable image synchronization.
+clipboard-image = ["input-event/clipboard-png", "dep:image"]
 layer_shell = [
     "dep:wayland-client",
     "dep:wayland-protocols",

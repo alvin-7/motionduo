@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mousehop 有线卡顿与窗口关闭排查</title>
+<style>
+:root{color-scheme:light;--ink:#172c39;--muted:#536672;--line:#cbd5d5;--paper:#f5f3eb;--blue:#155d7c;--amber:#925209}
+*{box-sizing:border-box}body{margin:0;color:var(--ink);background:radial-gradient(ellipse at top right,#dcebed,transparent 55%),var(--paper);font:16px/1.7 "Microsoft YaHei","PingFang SC",sans-serif}main{max-width:1000px;margin:auto;padding:44px 26px 70px}header{border-top:7px solid var(--blue);padding-top:22px}h1{font-size:clamp(27px,4vw,42px);line-height:1.25;margin:12px 0 20px}h2{font-size:23px;margin:34px 0 12px}h3{font-size:18px}p{margin:10px 0}.meta{color:var(--muted);font-size:14px}.lead{font-size:20px;max-width:850px}.cards{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:24px}.card{padding:20px 23px;border:1px solid var(--line);background:#ffffffa8}.label{font-size:13px;color:var(--blue);font-weight:bold}.pending{color:var(--amber)}.metric{font:42px/1.3 Georgia,serif;margin:9px 0}table{width:100%;border-collapse:collapse;background:#ffffff80}th,td{padding:11px 13px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:14px}code{font:13px/1.6 Consolas,monospace;overflow-wrap:anywhere}pre{padding:19px;background:#e4ecec;overflow:auto;font:14px/1.8 Consolas,monospace}li{margin:9px 0}a{color:var(--blue)}.note{border-left:4px solid var(--amber);padding:4px 16px;background:#fff6e5}footer{margin-top:36px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:14px}@media(max-width:650px){main{padding:25px 16px}.cards{grid-template-columns:1fr}table{font-size:14px}th,td{padding:9px 7px}}
+</style>
+<main>
+<header><div class="meta">2026-10-26 · Asia/Shanghai · v0.17.17 / 39e05587</div>
+<h1>有线卡顿：发现本地事件循环阻塞线索<br>窗口关闭：独立问题，尚未复现定位</h1>
+<p class="lead">不能把这次问题当作正常网络抖动。日志已确认输入恢复与断会话；Windows 本机状态查询也出现秒级响应空档。网络查询的同步阻塞是目前最强的代码线索，但还没有抓到故障瞬间的 Windows 阻塞栈。</p></header>
+<section class="cards">
+<article class="card"><div class="label">已测量 · Windows daemon</div><div class="metric">1.846 / 2.695 s</div><p>只读 IPC 查询的响应空档，约隔 30 秒出现。采样时业务连接已断开，不能解释成单纯等待 KCP 回包。</p></article>
+<article class="card"><div class="label pending">未定位 · Mac 窗口</div><h3>本地触控板也可能点不掉 ×</h3><p>已排除“只能由远程点击丢失解释”。当前采样没有抓到 GUI 死锁，不能因此排除间歇故障。</p></article>
+</section>
+<h2>一组实际故障时序</h2>
+<table><thead><tr><th>本地时间 +08</th><th>证据</th></tr></thead><tbody>
+<tr><td>17:15:01</td><td>Mac：<code>input recovery trigger: contiguous input progress deadline</code></td></tr>
+<tr><td>17:15:02</td><td>Mac：恢复因 <code>PeerTimeout</code> 关闭，会话报 <code>input recovery failed</code>。</td></tr>
+<tr><td>17:15:04</td><td>Windows：<code>peer_age=4706ms</code>，<code>pending=0 consuming=0</code>，对端活动超时。</td></tr>
+</tbody></table>
+<p>这组时序与用户报告的 2–5 秒停顿吻合，但不是对每一次停顿的完整抓包归因。日志中另有多次恢复，很多靠近周期性刷新时点。</p>
+<h2>为什么重点查网卡查询</h2>
+<pre>Windows 单线程 Tokio 事件循环
+    ├─ 输入、DTLS、KCP、心跳、IPC
+    ├─ 每 30 秒：发现服务 / 网络标识刷新
+    └─ 每 30 秒：监听地址核对
+                  ↓ 同步调用 netdev
+             枚举网卡 → 查询网关 MAC → SendARP
+                  ↓ 若阻塞
+           同一事件循环的其他任务不能推进</pre>
+<ul>
+<li><code>mousehop/src/main.rs:178</code>：当前线程 Tokio runtime。</li>
+<li><code>mousehop/src/service.rs:1217</code>：同步 discovery refresh，随后刷新网络标识；后者调用 <code>current_network_id()</code>。</li>
+<li><code>mousehop/src/listen.rs:650</code>：30 秒定时分支直接枚举监听地址。</li>
+<li>依赖 <code>netdev 0.43.0</code> 的 Windows 枚举实现查询网关时调用同步 <code>SendARP</code>。</li>
+</ul>
+<table><thead><tr><th>独立诊断程序</th><th>实测耗时</th></tr></thead><tbody>
+<tr><td><code>get_interfaces()</code></td><td>30–1159 ms</td></tr>
+<tr><td><code>get_default_gateway()</code></td><td>30–1168 ms</td></tr>
+<tr><td><code>get_default_interface()</code></td><td>154–1168 ms</td></tr>
+</tbody></table>
+<p>共测三轮；第一轮三个调用合计约 3.5 秒。一次刷新存在重复枚举，累积开销足以超过 300/600 ms 输入保护甚至 3 秒对端存活阈值。独立程序不是运行中 daemon 的精确调用耗时，且可能预热邻居缓存。</p>
+<p>运行中以 4 Hz 只读查询状态，17:23:11.504 / 17:23:42.393 分别记录 1846 / 2695 ms 的响应空档。结合源码支持本地调度阻塞假设；还不能把每一毫秒都归给 SendARP。</p>
+<h2>网线与 Wi-Fi 的区别</h2>
+<p>实际 Mac → Windows 路由使用 USB Ethernet <code>en6</code>。短时 20 包 ICMP 测试无丢包，平均 0.914 ms，接口计数未见错误／丢弃。它只能说明短采样链路正常，不能排除故障时刻的链路问题。</p>
+<p>有线场景可能改变网卡集合、路由／网关和邻居解析路径，使同步查询变慢；当前 Windows 还有虚拟网卡与 Mihomo 接口。尚未在受控条件下切换 Wi-Fi 做相同输入和调度对照，所以不能断言是 USB 网卡、代理或网线损坏。</p>
+<h2>窗口关闭问题的边界</h2>
+<p>Mac 的预期行为是点击 × 隐藏窗口、保留菜单栏与服务，不是退出进程。<code>mousehop-gtk/src/lib.rs:510</code> 已安装 hide-on-close 回调。</p>
+<p>17:16:19 的 GUI 栈显示主线程在 GTK/AppKit 事件等待中，没有抓到关闭失败。下一次失败时需同时采集 GUI 栈、窗口／模态状态和关闭回调是否执行；检查是否未收到 close-request、被模态窗口阻挡，或隐藏后又被重新呈现。以上均为待验证方向。</p>
+<h2>建议修复与验收</h2>
+<ol>
+<li><strong>先隔离慢网络查询。</strong> 后台有界执行、合并重复快照；仅将结果送回服务事件循环，避免在服务分支中等待慢查询而暂停输入分发。失败快照不能直接当作“网卡已消失”。</li>
+<li><strong>不放宽输入安全超时。</strong> 也不关闭输入恢复、不更换 GUI 框架来绕过卡顿。</li>
+<li><strong>独立复现 × 故障。</strong> 用触控板验证“隐藏 → 菜单栏重开”，并在失败瞬间抓栈后再决定修复。</li>
+<li><strong>性能纳入验收。</strong> 注入数秒慢查询仍应持续服务输入／心跳；查询最多一项在途、无无限任务堆积。实机有线与 Wi-Fi 各覆盖多个 30 秒刷新周期，检查事件循环延迟、CPU、线程数及停顿。</li>
+</ol>
+<aside class="note">本轮只做诊断：未重启应用、安装包、修改配置、切换网络或变更 TCC；未修复业务源码，也未声称问题已解决。</aside>
+<footer>原始证据：<code>target/diagnostics/wired-stall-20261026-1716/</code>（本地 ignored 目录）。后续排查约束已写入 <code>HANDOFF.MD</code>。</footer>
+</main>
+</html>

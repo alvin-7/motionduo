@@ -15,9 +15,9 @@ usage: $0 [APP_SVG [TRAY_SVG [ICNS [ICONSET]]]]
 
 ARGUMENTS
     APP_SVG  The app icon SVG (a self-contained rounded tile)
-             Defaults to ./mousehop-gtk/resources/com.mousehop.Mousehop.svg
+             Defaults to ./assets/brand/motionduo.svg
     TRAY_SVG The tray / menu-bar glyph SVG
-             Defaults to ./mousehop-gtk/resources/icons/mousehop-tray.svg
+             Defaults to ./assets/brand/motionduo-tray.svg
     ICNS     The icns file to create
              Defaults to ./target/icon.icns
     ICONSET  The iconset directory to create
@@ -31,15 +31,21 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     exit 0
 fi
 
-app_svg="${1:-./mousehop-gtk/resources/com.mousehop.Mousehop.svg}"
-tray_svg="${2:-./mousehop-gtk/resources/icons/mousehop-tray.svg}"
+app_svg="${1:-./assets/brand/motionduo.svg}"
+tray_svg="${2:-./assets/brand/motionduo-tray.svg}"
 icns="${3:-./target/icon.icns}"
 iconset="${4:-./target/icon.iconset}"
 
 set -u
 
 workdir="$(dirname "$iconset")/icon-work"
-rm -rf "$iconset" "$workdir"
+if [ "${MOUSEHOP_FRESH_BUNDLE:-0}" = 1 ]; then
+    for output in "$iconset" "$workdir" "$icns" "$(dirname "$icns")/menubar-template.png"; do
+        [ ! -e "$output" ] || { echo "Refusing to overwrite $output" >&2; exit 1; }
+    done
+else
+    rm -rf "$iconset" "$workdir"
+fi
 mkdir -p "$iconset" "$workdir"
 
 # Big Sur+ macOS icon template proportions (in a 1024 canvas):

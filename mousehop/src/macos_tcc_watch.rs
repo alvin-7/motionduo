@@ -12,8 +12,9 @@
 //! binary that runs `mousehop ax-probe` — a fresh process bypasses
 //! the parent's cached trust and consults the current TCC state. If
 //! the probe exits non-zero (AX revoked), we exit the daemon with
-//! `process::exit(0)`. The GUI's IPC-drop watcher then propagates
-//! the exit (see `mousehop_gtk::lib::receiver.recv` Err branch).
+//! `process::exit(0)`. The MyGo supervisor does not automatically restart a
+//! cleanly exited daemon; it reports the stop while keeping the tray available
+//! for an explicit restart after the user corrects permissions.
 //!
 //! Cost is negligible: one stat per 2s, plus one subprocess spawn
 //! per actual TCC change (rare — only fires when the user opens

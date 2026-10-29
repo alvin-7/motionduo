@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Screen Layout: Equal Shared Edges</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(120deg,#eaf0ee,#f7f5ef);color:#22252a;font:15px/1.6 Georgia,serif}
+main{max-width:900px;margin:28px auto;padding:28px;background:white;border:1px solid #dce2e7;border-radius:12px}
+h1{font-size:30px;line-height:1.2}h2{font-size:20px;margin-top:24px}.meta{color:#68707c}code{font-size:12px}img{width:100%;border:1px solid #dce2e7;border-radius:8px}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:16px}a{color:#265ca0}figure{margin:0}figcaption{font-size:13px;color:#68707c}
+@media(max-width:650px){main{margin:12px;padding:18px}.pair{grid-template-columns:1fr}}
+</style>
+<main>
+<p class="meta">Mousehop / MyGo Native / 2026-10-28</p>
+<h1>Equal Shared Edges</h1>
+<p>Screen thumbnails no longer become smaller merely because one computer has a lower resolution. Left/right neighbors use equal heights; top/bottom neighbors use equal widths. The other dimension scales proportionally, retaining each device's aspect ratio. Equal aspect ratios produce identical rectangles regardless of resolution.</p>
+<div class="pair">
+<figure><img src="../../target/layout-equal-edge-20261028/screens/Screen-layout-equal-edge-right.png" alt="Windows and Mac thumbnails with the same height"><figcaption>Horizontal: equal height, original aspect ratios.</figcaption></figure>
+<figure><img src="../../target/layout-equal-edge-20261028/screens/Screen-layout-equal-edge-top.png" alt="Windows and Mac thumbnails with the same width"><figcaption>Vertical: equal width, original aspect ratios.</figcaption></figure>
+</div>
+<p class="meta">MyGo renderer fixtures at 680 x 420, not screenshots of installed applications.</p>
+<h2>Interaction</h2>
+<p>The canvas reserves room for both normalized orientations, keeping the local screen stationary throughout a drag. The remote thumbnail changes size when snapping between horizontal and vertical neighbors. Snap distances compare centers so resizing cannot shift the snap target away from the pointer.</p>
+<p>Equal edges make both corner outlines overlap. A slight cross-axis drag selects the corresponding top/bottom or left/right alignment guide; near the center, the existing anchor is retained. All eight side/corner combinations remain selectable without adding controls.</p>
+<p>Pointer motion still sends no configuration requests. Drop sends exactly one atomic placement command. Cancellation, timeout rollback, confirmation and peer-switch/deletion protections remain covered by existing interaction tests.</p>
+<h2>Verification &amp; Boundaries</h2>
+<ul>
+<li>Windows Go suite: 141 passed, including subtests; macOS native Go suite: 133 passed. Go vet passes on both hosts.</li>
+<li>Tests cover equal-aspect resolution independence, unequal aspect ratios, Win/Mac and portrait geometry, missing/zero geometry, all eight snaps, compact widths and stationary local geometry.</li>
+<li>Windows icon-bearing debug build and native macOS ARM64 frontend build pass. No new timers, redraw loops or network calls; geometry remains constant-sized arithmetic on existing render/drag events.</li>
+<li>An initial Windows run failed the unrelated supervisor ready-marker check. The full suite then passed, and that supervisor test passed three consecutive repetitions without changing its source. A readiness-file read/write race is a possibility, not a proven cause of this transient failure.</li>
+<li>Only frontend geometry/interactions and documentation change. Backend display dimensions, physical input and crossing transforms are unchanged. Real unequal screens still obey their existing overlap rules.</li>
+<li>Installed applications and previously delivered installers/DMG are untouched. No new test package, installation, commit or publication. Physical installed-application interaction was not re-tested.</li>
+</ul>
+<p><a href="../../mousehop-mygo/layout.go">Geometry and snapping</a> &middot; <a href="../../mousehop-mygo/layout_test.go">Regression tests</a> &middot; <a href="../../target/layout-equal-edge-20261028/win-tests.jsonl">Windows results</a> &middot; <a href="../../target/layout-equal-edge-20261028/mac-tests.jsonl">macOS results</a></p>
+</main>
+</html>

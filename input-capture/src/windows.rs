@@ -31,8 +31,8 @@ impl Capture for WindowsInputCapture {
         Ok(())
     }
 
-    async fn release(&mut self, _warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
-        self.event_thread.release_capture();
+    async fn release(&mut self, warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
+        self.event_thread.release_capture(warp_target);
         Ok(())
     }
 
@@ -47,6 +47,14 @@ impl Capture for WindowsInputCapture {
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
+    }
+
+    fn display_layout(&self) -> Option<input_event::display::DisplayLayout> {
+        event_thread::display_snapshot()
+    }
+
+    fn display_bounds(&self) -> Option<(u32, u32)> {
+        event_thread::display_snapshot()?.size()
     }
 }
 

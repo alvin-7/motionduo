@@ -1,7 +1,22 @@
-Mousehop
-========
+MotionDuo
+=========
 
-Mousehop is a fork of lan-mouse (https://github.com/feschber/lan-mouse).
+MotionDuo is a modified version of Mousehop
+(https://github.com/jondkinney/mousehop), which is a fork of lan-mouse
+(https://github.com/feschber/lan-mouse).
+
+MotionDuo source: https://github.com/alvin-7/motionduo
+
+MotionDuo modifications are maintained by alvin-7 and the MotionDuo
+contributors. This branch was renamed MotionDuo in October 2026. Changes
+include the native Go frontend, cross-device clipboard synchronization,
+input transport and settings improvements, and new MotionDuo artwork.
+MotionDuo is distributed under the GNU General Public License, version 3
+or (at your option) any later version (SPDX: GPL-3.0-or-later).
+The new name and artwork do not imply endorsement by upstream authors.
+
+Upstream notices (retained)
+---------------------------
 
 Original work Copyright (C) 2022 Ferdinand Schober and the lan-mouse
 contributors. Licensed under the GNU General Public License, version 3

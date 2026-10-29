@@ -27,6 +27,10 @@ use wayland_client::{
 
 #[derive(Debug, Error)]
 pub enum EmulationError {
+    #[error("backend cannot certify safe same-connection recovery")]
+    RecoveryUnsupported,
+    #[error("background input task failed: {0}")]
+    BackgroundTask(String),
     #[error("event stream closed")]
     EndOfStream,
     #[error("display topology is unavailable for an absolute cursor warp")]
@@ -49,6 +53,9 @@ pub enum EmulationError {
     #[cfg(target_os = "macos")]
     #[error("core-graphics error: {0}")]
     CoreGraphics(CGError),
+    #[cfg(target_os = "macos")]
+    #[error("macOS keyboard injection failed on both paths: status {0}")]
+    KeyboardInjection(i32),
 }
 
 #[derive(Debug, Error)]

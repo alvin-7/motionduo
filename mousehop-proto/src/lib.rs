@@ -1,3 +1,6 @@
+pub mod clipboard_transfer;
+pub mod transport;
+
 use input_event::{
     ClipboardEvent, Event as InputEvent, KeyboardEvent, PointerEvent,
     display::{DisplayLayout, DisplayRect},
@@ -56,7 +59,7 @@ pub const LEAVE_RELEASE_ONLY: u32 = 1;
 /// instance and has its connection refused. mousehop is deliberately
 /// **not** wire-compatible with lan-mouse or any other fork — change
 /// this magic to force a hard break against a future divergence.
-pub const PROTOCOL_MAGIC: [u8; 8] = *b"MOUSEHOP";
+pub const PROTOCOL_MAGIC: [u8; 8] = *b"MHOP0002";
 
 /// Peer supports the session-scoped, retransmittable
 /// [`ProtoEvent::HandoverEnter`] handshake.
@@ -72,8 +75,43 @@ pub const CAP_ATOMIC_HANDOVER: u32 = 1 << 0;
 /// was actually applied.
 pub const CAP_TRANSACTIONAL_HANDOVER: u32 = 1 << 1;
 
+/// Controller requests replay of source-generated trackpad momentum.
+/// This is a per-connection preference, not an always-advertised capability.
+pub const CAP_SCROLL_INERTIA_REQUEST: u32 = 1 << 4;
+
 /// Capabilities implemented completely by this protocol build.
 pub const PROTOCOL_CAPABILITIES: u32 = CAP_ATOMIC_HANDOVER | CAP_TRANSACTIONAL_HANDOVER;
+
+#[cfg(test)]
+mod scroll_inertia_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_inertia_preference_roundtrips_with_transport_capabilities() {
+        for requested in [false, true] {
+            for transport in [0, transport::CAP_KCP_INPUT_V1 | transport::CAP_KCP_REQUEST] {
+                let capabilities = PROTOCOL_CAPABILITIES
+                    | transport
+                    | if requested {
+                        CAP_SCROLL_INERTIA_REQUEST
+                    } else {
+                        0
+                    };
+                let hello = ProtoEvent::Hello {
+                    magic: PROTOCOL_MAGIC,
+                    commit: [0; 8],
+                    capabilities,
+                };
+                let (bytes, len): ([u8; MAX_EVENT_SIZE], usize) = hello.into();
+                let decoded = decode_fixed_event(&bytes[..len]).unwrap();
+                assert!(
+                    matches!(decoded, ProtoEvent::Hello { capabilities: actual, .. } if actual == capabilities)
+                );
+            }
+        }
+        assert_eq!(PROTOCOL_CAPABILITIES & CAP_SCROLL_INERTIA_REQUEST, 0);
+    }
+}
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -195,6 +233,8 @@ pub enum ProtoEvent {
     Ping,
     /// Response to [`ProtoEvent::Ping`], true if emulation is enabled / available
     Pong(bool),
+    /// Authenticated peer has explicitly revoked this controller.
+    ApprovalRevoked,
     /// Display geometry of the receiving device. Sent by the
     /// emulation side immediately before the [`ProtoEvent::Ack`] of
     /// an [`ProtoEvent::Enter`] so the capturing peer can model the
@@ -329,6 +369,7 @@ impl Display for ProtoEvent {
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
             ProtoEvent::Ping => write!(f, "ping"),
+            ProtoEvent::ApprovalRevoked => write!(f, "approval revoked"),
             ProtoEvent::Pong(alive) => {
                 write!(
                     f,
@@ -462,6 +503,7 @@ pub enum EventType {
     HandoverLeaveAck,
     /// Receiver reports that a handover serial no longer owns input.
     OwnershipLost,
+    ApprovalRevoked,
 }
 
 fn input_event_wire_len(event_type: EventType) -> Option<usize> {
@@ -560,6 +602,7 @@ impl ProtoEvent {
                 },
             },
             ProtoEvent::Ping => EventType::Ping,
+            ProtoEvent::ApprovalRevoked => EventType::ApprovalRevoked,
             ProtoEvent::Pong(_) => EventType::Pong,
             ProtoEvent::Enter(_) => EventType::Enter,
             ProtoEvent::Leave(_) => EventType::Leave,
@@ -599,6 +642,7 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 Ok(Self::Input(decode_input_payload(event_type, &mut buf)?))
             }
             EventType::Ping => Ok(Self::Ping),
+            EventType::ApprovalRevoked => Ok(Self::ApprovalRevoked),
             EventType::Pong => Ok(Self::Pong(decode_u8(&mut buf)? != 0)),
             EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
@@ -714,7 +758,7 @@ pub fn decode_fixed_event(bytes: &[u8]) -> Result<ProtoEvent, ProtocolError> {
         EventType::PointerAxisValue120 => (bytes.len() == 6, "6 bytes"),
         EventType::KeyboardKey => (bytes.len() == 10, "10 bytes"),
         EventType::KeyboardModifiers => (bytes.len() == 17, "17 bytes"),
-        EventType::Ping => (bytes.len() == 1, "1 byte"),
+        EventType::Ping | EventType::ApprovalRevoked => (bytes.len() == 1, "1 byte"),
         EventType::Pong | EventType::Enter => (bytes.len() == 2, "2 bytes"),
         EventType::Leave | EventType::Ack => (bytes.len() == 5, "5 bytes"),
         EventType::Bounds | EventType::MotionAbsolute | EventType::ReceiverSensitivity => {
@@ -822,7 +866,7 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         );
                     }
                 },
-                ProtoEvent::Ping => {}
+                ProtoEvent::Ping | ProtoEvent::ApprovalRevoked => {}
                 ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),

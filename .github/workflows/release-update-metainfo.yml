@@ -25,6 +25,7 @@ on:
 
 jobs:
   update:
+    if: ${{ github.event_name != 'release' || github.event.release.prerelease == false }}
     name: Update metainfo from CHANGELOG
     runs-on: ubuntu-latest
     permissions:

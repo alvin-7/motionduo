@@ -8,7 +8,8 @@ use std::{
 use slab::Slab;
 
 use mousehop_ipc::{
-    ClientConfig, ClientHandle, ClientState, ConnectionMode, CrossingModifier, IfaceKind, Position,
+    ClientConfig, ClientConnectionConfig, ClientHandle, ClientState, ConnectionMode,
+    CrossingModifier, IfaceKind, Position,
 };
 
 use crate::config::ConfigClient;
@@ -30,6 +31,11 @@ impl ClientManager {
 
     pub fn add_with_config(&self, config_client: ConfigClient) -> ClientHandle {
         let config = ClientConfig {
+            alias: config_client.alias,
+            expected_fingerprint: config_client.expected_fingerprint,
+            approval_paused: config_client.approval_paused,
+            approval_nonce: config_client.approval_nonce,
+            alignment: config_client.alignment,
             hostname: config_client.hostname,
             fix_ips: config_client.ips.into_iter().collect(),
             port: config_client.port,
@@ -39,6 +45,8 @@ impl ClientManager {
             network_locks: config_client.network_locks,
             clipboard_send: config_client.clipboard_send,
             command_as_ctrl: config_client.command_as_ctrl,
+            use_kcp: config_client.use_kcp,
+            scroll_inertia: config_client.scroll_inertia,
             require_crossing_modifier: config_client.require_crossing_modifier,
             crossing_modifier: config_client.crossing_modifier,
         };
@@ -151,6 +159,11 @@ impl ClientManager {
             .and_then(|(c, _)| c.hostname.clone())
     }
 
+    pub(crate) fn expected_fingerprint(&self, handle: ClientHandle) -> Option<String> {
+        self.get_state(handle)
+            .and_then(|(config, _)| config.expected_fingerprint)
+    }
+
     /// get the position of the corresponding client
     pub(crate) fn get_pos(&self, handle: ClientHandle) -> Option<Position> {
         self.clients
@@ -187,30 +200,72 @@ impl ClientManager {
         self.update_ips(handle);
     }
 
-    /// update the dns-ips of the client
-    pub fn set_dns_ips(&self, handle: ClientHandle, dns_ips: Vec<IpAddr>) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.dns_ips = dns_ips
-        }
-        self.update_ips(handle);
-    }
-
     fn update_ips(&self, handle: ClientHandle) {
         if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.ips = c
-                .fix_ips
-                .iter()
-                .cloned()
-                .chain(s.dns_ips.iter().cloned())
-                .chain(s.discovered_ips.iter().cloned())
-                .collect::<HashSet<_>>();
-            // Drop per-address metadata for addresses that are no longer
-            // candidates so the GUI never shows a stale RTT / label next
-            // to an IP that has since disappeared from DNS / discovery /
-            // the fix list.
-            s.latencies.retain(|ip, _| s.ips.contains(ip));
-            s.interfaces.retain(|ip, _| s.ips.contains(ip));
+            Self::recompute_ips(c, s);
         }
+    }
+
+    fn recompute_ips(config: &ClientConfig, state: &mut ClientState) {
+        state.ips = config
+            .fix_ips
+            .iter()
+            .chain(state.dns_ips.iter())
+            .chain(state.discovered_ips.iter())
+            .copied()
+            .collect();
+        state.latencies.retain(|ip, _| state.ips.contains(ip));
+        state.interfaces.retain(|ip, _| state.ips.contains(ip));
+    }
+
+    pub(crate) fn set_connection_config(
+        &self,
+        handle: ClientHandle,
+        settings: ClientConnectionConfig,
+    ) {
+        let mut clients = self.clients.borrow_mut();
+        let Some((config, state)) = clients.get_mut(handle as usize) else {
+            return;
+        };
+        let reconnect = !ClientConnectionConfig::from(&*config).same_endpoint(&settings);
+        if config.hostname != settings.hostname {
+            state.dns_ips.clear();
+            state.discovered_ips.clear();
+            state.latencies.clear();
+            state.interfaces.clear();
+            state.resolving = false;
+        }
+        config.hostname = settings.hostname;
+        config.fix_ips = settings.fix_ips;
+        config.port = settings.port;
+        config.cmd = settings.cmd;
+        if reconnect {
+            state.active_addr = None;
+            state.alive = false;
+            state.display_size = None;
+            state.peer_commit = None;
+            state.transport_status.clear();
+        }
+        Self::recompute_ips(config, state);
+    }
+
+    pub(crate) fn accept_dns_result(
+        &self,
+        handle: ClientHandle,
+        hostname: &str,
+        ips: Vec<IpAddr>,
+    ) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((config, state)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        if config.hostname.as_deref() != Some(hostname) {
+            return false;
+        }
+        state.resolving = false;
+        state.dns_ips = ips;
+        Self::recompute_ips(config, state);
+        true
     }
 
     /// update the hostname of the given client
@@ -258,6 +313,23 @@ impl ClientManager {
         }
     }
 
+    /// Update both layout fields before capture or a frontend observes either.
+    pub(crate) fn set_screen_placement(
+        &self,
+        handle: ClientHandle,
+        pos: Position,
+        alignment: mousehop_ipc::ScreenAlignment,
+    ) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((config, state)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        let recreate_capture = config.pos != pos && state.active;
+        config.pos = pos;
+        config.alignment = alignment;
+        recreate_capture
+    }
+
     /// update the enter hook command of the client
     pub(crate) fn set_enter_hook(&self, handle: ClientHandle, enter_hook: Option<String>) {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
@@ -301,6 +373,9 @@ impl ClientManager {
 
     pub(crate) fn set_active_addr(&self, handle: ClientHandle, addr: Option<SocketAddr>) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            if s.active_addr != addr {
+                s.display_size = None;
+            }
             s.active_addr = addr;
         }
     }
@@ -309,6 +384,16 @@ impl ClientManager {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.alive = alive;
         }
+    }
+
+    pub(crate) fn set_display_size(&self, handle: ClientHandle, size: (u32, u32)) -> bool {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            if state.display_size != Some(size) {
+                state.display_size = Some(size);
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
@@ -346,21 +431,34 @@ impl ClientManager {
             .map(|(_, s)| s.ips.clone())
     }
 
-    /// Update the per-pair clipboard-send gate for the given client.
-    /// Returns `true` when the value changed (so callers can avoid
-    /// no-op config writes / frontend broadcasts).
-    pub(crate) fn set_clipboard_send(&self, handle: ClientHandle, enabled: bool) -> bool {
+    /// Update the macOS Command-to-Control alias for an outgoing
+    /// client. Returns `true` only when the value changed.
+    pub(crate) fn set_use_kcp(&self, handle: ClientHandle, enabled: bool) -> bool {
         match self.clients.borrow_mut().get_mut(handle as usize) {
-            Some((c, _)) if c.clipboard_send != enabled => {
-                c.clipboard_send = enabled;
+            Some((c, _)) if c.use_kcp != enabled => {
+                c.use_kcp = enabled;
                 true
             }
             _ => false,
         }
     }
 
-    /// Update the macOS Command-to-Control alias for an outgoing
-    /// client. Returns `true` only when the value changed.
+    pub(crate) fn set_scroll_inertia(&self, handle: ClientHandle, enabled: bool) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.scroll_inertia != enabled => {
+                c.scroll_inertia = enabled;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn set_transport_status(&self, handle: ClientHandle, status: &str) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.transport_status = status.to_owned();
+        }
+    }
+
     pub(crate) fn set_command_as_ctrl(&self, handle: ClientHandle, enabled: bool) -> bool {
         match self.clients.borrow_mut().get_mut(handle as usize) {
             Some((c, _)) if c.command_as_ctrl != enabled => {
@@ -624,19 +722,6 @@ impl ClientManager {
             })
             .collect()
     }
-
-    /// Snapshot of every client whose `clipboard_send` is true and
-    /// whose state is `active`. Used by Service to fan-out a local
-    /// clipboard change without holding the manager's borrow across
-    /// async sends.
-    pub(crate) fn clipboard_send_targets(&self) -> Vec<ClientHandle> {
-        self.clients
-            .borrow()
-            .iter()
-            .filter(|(_, (c, s))| c.clipboard_send && s.active)
-            .map(|(k, _)| k as ClientHandle)
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -652,6 +737,11 @@ mod tests {
     fn manager_with_ips(ips: &[IpAddr]) -> (ClientManager, ClientHandle) {
         let cm = ClientManager::default();
         let handle = cm.add_with_config(ConfigClient {
+            alias: String::new(),
+            expected_fingerprint: None,
+            approval_paused: false,
+            approval_nonce: 0,
+            alignment: Default::default(),
             ips: ips.iter().copied().collect(),
             hostname: None,
             port: 4252,
@@ -662,10 +752,132 @@ mod tests {
             network_locks: HashMap::new(),
             clipboard_send: false,
             command_as_ctrl: false,
+            use_kcp: false,
+            scroll_inertia: false,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         });
         (cm, handle)
+    }
+
+    #[test]
+    fn connection_edit_is_atomic_and_preserves_identity_permissions_and_layout() {
+        let (clients, handle) = manager_with_ips(&[ip(1)]);
+        let (mut config, mut state) = clients.get_state(handle).unwrap();
+        config.hostname = Some("old.local".into());
+        config.expected_fingerprint = Some("pinned-certificate".into());
+        config.clipboard_send = true;
+        config.use_kcp = true;
+        config.pos = Position::Top;
+        config.network_locks.insert("other-lan".into(), ip(9));
+        state.active = true;
+        state.alive = true;
+        state.active_addr = Some(SocketAddr::new(ip(1), 4252));
+        state.dns_ips = vec![ip(2)];
+        state.discovered_ips = vec![ip(3)];
+        state.interfaces.insert(ip(3), IfaceKind::Wired);
+        state.latencies.insert(ip(3), Some(100));
+        state.display_size = Some((1920, 1080));
+        clients.set_config(handle, config);
+        clients.set_state(handle, state);
+
+        clients.set_connection_config(
+            handle,
+            ClientConnectionConfig {
+                hostname: Some("new.local".into()),
+                fix_ips: vec![ip(4)],
+                port: 4253,
+                cmd: Some("true".into()),
+            },
+        );
+        let (config, state) = clients.get_state(handle).unwrap();
+        assert_eq!(config.hostname.as_deref(), Some("new.local"));
+        assert_eq!(config.fix_ips, vec![ip(4)]);
+        assert_eq!(config.port, 4253);
+        assert_eq!(config.cmd.as_deref(), Some("true"));
+        assert_eq!(
+            config.expected_fingerprint.as_deref(),
+            Some("pinned-certificate")
+        );
+        assert!(config.clipboard_send && config.use_kcp);
+        assert_eq!(config.pos, Position::Top);
+        assert_eq!(config.network_locks.get("other-lan"), Some(&ip(9)));
+        assert!(state.active);
+        assert!(!state.alive);
+        assert!(state.active_addr.is_none() && state.display_size.is_none());
+        assert!(state.dns_ips.is_empty() && state.discovered_ips.is_empty());
+        assert!(state.interfaces.is_empty() && state.latencies.is_empty());
+        assert_eq!(state.ips, HashSet::from([ip(4)]));
+    }
+
+    #[test]
+    fn hook_only_edit_does_not_clear_live_connection_or_activate_inactive_peer() {
+        let (clients, handle) = manager_with_ips(&[ip(1)]);
+        let (config, mut state) = clients.get_state(handle).unwrap();
+        state.alive = true;
+        state.active_addr = Some(SocketAddr::new(ip(1), 4252));
+        state.display_size = Some((1280, 720));
+        clients.set_state(handle, state);
+        let mut settings = ClientConnectionConfig::from(&config);
+        settings.cmd = Some("true".into());
+        clients.set_connection_config(handle, settings);
+        let (_, state) = clients.get_state(handle).unwrap();
+        assert!(!state.active);
+        assert!(state.alive);
+        assert_eq!(state.active_addr, Some(SocketAddr::new(ip(1), 4252)));
+        assert_eq!(state.display_size, Some((1280, 720)));
+    }
+
+    #[test]
+    fn old_dns_result_cannot_repopulate_a_changed_connection() {
+        let (clients, handle) = manager_with_ips(&[ip(1)]);
+        clients.set_hostname(handle, Some("new.local".into()));
+        assert!(!clients.accept_dns_result(handle, "old.local", vec![ip(2)]));
+        assert_eq!(clients.get_ips(handle), Some(HashSet::from([ip(1)])));
+        assert!(clients.accept_dns_result(handle, "new.local", vec![ip(3)]));
+        assert_eq!(clients.get_ips(handle), Some(HashSet::from([ip(1), ip(3)])));
+        clients.set_hostname(handle, None);
+        assert!(!clients.accept_dns_result(handle, "new.local", vec![ip(4)]));
+    }
+
+    #[test]
+    fn screen_placement_updates_edge_and_corner_without_activating_inactive_peer() {
+        let (clients, handle) = manager_with_ips(&[]);
+        assert!(!clients.set_screen_placement(
+            handle,
+            Position::Right,
+            mousehop_ipc::ScreenAlignment::BottomRight,
+        ));
+        let (config, state) = clients.get_state(handle).unwrap();
+        assert_eq!(config.pos, Position::Right);
+        assert_eq!(config.alignment, mousehop_ipc::ScreenAlignment::BottomRight);
+        assert!(!state.active);
+
+        clients.activate_client(handle);
+        assert!(clients.set_screen_placement(
+            handle,
+            Position::Left,
+            mousehop_ipc::ScreenAlignment::TopLeft,
+        ));
+        let (config, state) = clients.get_state(handle).unwrap();
+        assert_eq!(config.pos, Position::Left);
+        assert_eq!(config.alignment, mousehop_ipc::ScreenAlignment::TopLeft);
+        assert!(state.active);
+        assert!(!clients.set_screen_placement(
+            handle,
+            Position::Left,
+            mousehop_ipc::ScreenAlignment::BottomLeft,
+        ));
+        assert_eq!(
+            clients.get_state(handle).unwrap().0.alignment,
+            mousehop_ipc::ScreenAlignment::BottomLeft,
+        );
+        clients.remove_client(handle);
+        assert!(!clients.set_screen_placement(
+            handle,
+            Position::Top,
+            mousehop_ipc::ScreenAlignment::TopRight,
+        ));
     }
 
     const NET_A: &str = "gw:aa:bb:cc:dd:ee:01";
@@ -774,6 +986,22 @@ mod tests {
         assert!(!cm.set_command_as_ctrl(h, true));
         assert!(cm.set_command_as_ctrl(h, false));
         assert!(!cm.command_as_ctrl(h));
+    }
+
+    #[test]
+    fn outgoing_transport_preferences_and_status_are_per_peer() {
+        let cm = ClientManager::default();
+        let a = cm.add_client();
+        let b = cm.add_client();
+        assert!(cm.set_use_kcp(a, true));
+        assert!(!cm.set_use_kcp(a, true));
+        cm.set_transport_status(a, "KCP");
+        cm.set_transport_status(b, "Legacy");
+        assert!(cm.get_state(a).unwrap().0.use_kcp);
+        assert!(!cm.get_state(b).unwrap().0.use_kcp);
+        assert!(cm.set_use_kcp(a, false));
+        assert_eq!(cm.get_state(b).unwrap().1.transport_status, "Legacy");
+        assert!(!cm.set_use_kcp(u64::MAX, true));
     }
 
     #[test]

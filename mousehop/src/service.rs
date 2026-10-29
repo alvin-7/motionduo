@@ -1,3 +1,5 @@
+#[cfg(any(windows, target_os = "macos"))]
+use crate::clipboard_focus_native::NativeFocusBackend;
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
@@ -9,30 +11,57 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     latency::{LatencyProber, ProbeResult},
     listen::{ListenerCreationError, ListenerSession, MousehopListener},
-    network::current_network_id,
+    nearby::{NearbyDevices, email_group, normalize_email},
+    network::{BackgroundRefresh, NetworkSnapshot},
+};
+#[cfg(any(windows, target_os = "macos"))]
+use crate::{
+    clipboard_focus::{FocusManager, LaneKey},
+    clipboard_session::{Formats, SessionContext},
 };
 use futures::StreamExt;
-use input_capture::clipboard::{ClipboardMonitor, SuppressionList};
 use input_capture::frontmost_app;
-use input_event::{ClipboardEvent, Event as InputEvent};
 use local_channel::mpsc::{Receiver, channel};
 use log;
 use mousehop_ipc::{
-    AppIdent, AsyncFrontendListener, ClientHandle, ConnectionMode, FrontendEvent, FrontendRequest,
-    HostKind, IncomingPeerConfig, IpcError, IpcListenerCreationError, Position, RemoteHostState,
-    Status,
+    AsyncFrontendListener, ClientConnectionConfig, ClientHandle, ConnectionMode, FrontendEvent,
+    FrontendRequest, IncomingPeerConfig, IpcError, IpcListenerCreationError, PairingRequest,
+    Position, RemoteHostState, Status,
 };
 use mousehop_proto::ProtoEvent;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    hash::{DefaultHasher, Hash, Hasher},
     io,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
+
+pub(crate) const MAX_CLIPBOARD_PEERS: usize = 8;
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn clipboard_peer_allowed(
+    enabled: bool,
+    inbound: bool,
+    fingerprint: &str,
+    authorized: &HashMap<String, IncomingPeerConfig>,
+    pinned: &HashSet<String>,
+) -> bool {
+    enabled
+        && if inbound {
+            authorized.contains_key(fingerprint)
+        } else {
+            pinned.contains(fingerprint)
+        }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+type ClipboardManager = FocusManager<Arc<crate::transport::ClipboardLane>, NativeFocusBackend>;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+type ClipboardManager = ();
 
 async fn shutdown_signal() -> io::Result<()> {
     #[cfg(unix)]
@@ -62,6 +91,9 @@ pub enum ServiceError {
 }
 
 pub struct Service {
+    clipboard: Option<ClipboardManager>,
+    clipboard_suppression: input_capture::clipboard::SuppressionList,
+    clipboard_owner: crate::listen::ClipboardOwner,
     /// configuration
     config: Config,
     /// input capture
@@ -114,33 +146,22 @@ pub struct Service {
     /// browse task — folded into client candidate sets + interface
     /// labels in the main loop.
     discovery_event_rx: Receiver<DiscoveryEvent>,
+    nearby: NearbyDevices,
+    admissions: crate::approval::Admissions,
+    pairing_requests: HashMap<String, (PairingRequest, Instant)>,
+    rejected_pairing: HashMap<String, Instant>,
+    pairing_dials: HashMap<ClientHandle, Instant>,
+    shutdown_requested: bool,
+    local_display_size: Option<(u32, u32)>,
     /// Opaque fingerprint of the network the machine is currently on
     /// (default-gateway MAC, or subnet fallback). Drives per-network
     /// lock resolution; recomputed periodically and on interface
     /// changes. `None` when undeterminable (locks then don't apply).
     current_network: Option<String>,
-    /// Outgoing connection handle to fan clipboard frames out from
-    /// the capture / forwarding paths. Same handle Capture owns;
-    /// cloned in `Service::new` so Service can call `send` directly
-    /// without routing through the capture session loop.
+    network_refresh: BackgroundRefresh<Result<NetworkSnapshot, &'static str>>,
+    pending_network_requests: VecDeque<FrontendRequest>,
+    /// Shared outgoing connection used to reset input sessions after policy changes.
     conn: MousehopConnection,
-    /// Cross-platform clipboard poller. `None` when the platform
-    /// clipboard couldn't be opened (headless CI, Wayland session
-    /// without compositor support). Service drains it in the main
-    /// loop and fans the resulting events out to peers whose
-    /// `clipboard_send` is true.
-    clipboard_monitor: Option<ClipboardMonitor>,
-    /// Recent forwards keyed on `(originator_fingerprint, hash)`.
-    /// Used to break N-peer rebroadcast cycles: when this device
-    /// receives a forwarded clipboard frame and would re-fan to
-    /// other peers, the entry under (origin, content_hash) blocks
-    /// the duplicate. Pruned lazily — entries older than
-    /// `RECENT_FORWARD_TTL` are dropped on each clipboard event.
-    recent_forwarded: HashMap<(String, u64), Instant>,
-    /// Shared with [`ClipboardMonitor`]; mutations to the inner
-    /// `HashSet` take effect on the next clipboard poll without
-    /// rebuilding the monitor.
-    clipboard_suppression: SuppressionList,
     /// Per-client count of consecutive probe observations where a
     /// substantially-faster candidate beat the active path, gating the
     /// `Fastest`-mode auto-upgrade so noise can't trigger a switch.
@@ -153,12 +174,15 @@ pub struct Service {
 /// latency dip never causes a flap.
 const FASTEST_UPGRADE_STREAK: u8 = 3;
 
-const RECENT_FORWARD_TTL: Duration = Duration::from_secs(1);
-
-fn clipboard_hash(content: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
+fn discard_network_requests_for_client(
+    requests: &mut VecDeque<FrontendRequest>,
+    removed: ClientHandle,
+) {
+    requests.retain(|request| {
+        !matches!(request,
+            FrontendRequest::SetConnectionMode(handle, _) | FrontendRequest::SetNetworkLock(handle, _)
+                if *handle == removed)
+    });
 }
 
 #[derive(Debug)]
@@ -223,11 +247,24 @@ impl Service {
         // the dialer side so its references survive Discovery
         // toggles; Discovery writes peer hints into it as browse
         // events arrive.
-        let listener =
-            MousehopListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+        // Snapshot once: config reload/save preserves the new value for restart,
+        // while all current and future sessions of this process keep this policy.
+        let kcp_timeouts = config.kcp_timeouts();
+        let listener = MousehopListener::new(
+            config.port(),
+            cert.clone(),
+            authorized_keys.clone(),
+            kcp_timeouts,
+        )
+        .await?;
+        let admissions = listener.admissions();
         let primary_cache: PrimaryCache = Default::default();
-        let conn =
-            MousehopConnection::new(cert.clone(), client_manager.clone(), primary_cache.clone());
+        let conn = MousehopConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            primary_cache.clone(),
+            kcp_timeouts,
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -239,6 +276,7 @@ impl Service {
             config.release_threshold_px(),
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
+        let clipboard_owner = listener.clipboard_owner();
         let emulation = Emulation::new(emulation_backend, listener);
         // Push the persisted authorized-peers table into the receive
         // pipeline so per-peer post-processing is applied from the
@@ -255,44 +293,49 @@ impl Service {
 
         let port = config.port();
         let (discovery_event_tx, discovery_event_rx) = channel();
-        let discovery = Discovery::new(
+        let mut network_refresh = BackgroundRefresh::new();
+        network_refresh.request(NetworkSnapshot::query);
+        let network = match network_refresh.event().await {
+            Ok(Ok(network)) => network,
+            result => {
+                log::warn!("initial network query failed: {result:?}");
+                NetworkSnapshot::default()
+            }
+        };
+        let current_network = network.network_id.clone();
+        let mut discovery = Discovery::new(
             port,
             config.mdns_discovery(),
             primary_cache.clone(),
             discovery_event_tx,
+            network,
         );
+        discovery.set_identity(config.discovery_email().as_deref(), &public_key_fingerprint);
         // Resolve the lock (if any) for the network we boot on, before
         // the first dial, so a locked client connects on the right
         // interface immediately.
-        let current_network = current_network_id();
         for handle in client_manager.registered_clients() {
             client_manager.recompute_active_lock(handle, current_network.as_deref());
         }
-        // ClipboardMonitor is best-effort: a headless CI environment
-        // or a Wayland session without compositor support yields a
-        // permanent error here. We log and proceed without clipboard
-        // sync rather than tying daemon startup to clipboard
-        // availability.
-        let clipboard_suppression: SuppressionList = {
-            let host = HostKind::current();
-            let initial: HashSet<AppIdent> = config
+        let clipboard_suppression = Arc::new(Mutex::new(
+            config
                 .clipboard_suppression()
                 .host()
                 .iter()
                 .cloned()
-                .map(|s| host.make_ident(s))
-                .collect();
-            Arc::new(std::sync::Mutex::new(initial))
-        };
-        let clipboard_monitor =
-            match ClipboardMonitor::with_suppression(clipboard_suppression.clone()) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    log::warn!("clipboard monitor unavailable: {e}; clipboard sync disabled");
-                    None
-                }
-            };
+                .map(mousehop_ipc::host_app_ident)
+                .collect(),
+        ));
+        #[cfg(any(windows, target_os = "macos"))]
+        let clipboard = Some(FocusManager::new(Arc::new(NativeFocusBackend::new(
+            clipboard_suppression.clone(),
+        ))));
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let clipboard = None;
         let service = Self {
+            clipboard,
+            clipboard_suppression,
+            clipboard_owner,
             config,
             capture,
             emulation,
@@ -314,11 +357,17 @@ impl Service {
             next_trigger_handle: 0,
             discovery,
             discovery_event_rx,
+            nearby: NearbyDevices::default(),
+            admissions,
+            pairing_requests: HashMap::new(),
+            rejected_pairing: HashMap::new(),
+            pairing_dials: HashMap::new(),
+            shutdown_requested: false,
+            local_display_size: None,
             current_network,
+            network_refresh,
+            pending_network_requests: VecDeque::new(),
             conn: conn_for_service,
-            clipboard_monitor,
-            recent_forwarded: HashMap::new(),
-            clipboard_suppression,
             fastest_streak: HashMap::new(),
         };
         Ok(service)
@@ -340,18 +389,27 @@ impl Service {
         // Periodic refresh of the Discovery service registration so
         // its TXT record stays accurate when the OS-preferred
         // interface (default route) changes — e.g. user switches
-        // off Wi-Fi and Mac falls back to Ethernet. Cheap: at most
-        // one re-publish every 30s, and a no-op when the primary
-        // hasn't moved. `Skip` so a long suspend doesn't backlog-
+        // off Wi-Fi and Mac falls back to Ethernet. OS enumeration runs
+        // on one blocking worker; unchanged snapshots aren't re-published.
+        // `Skip` so a long suspend doesn't backlog-
         // burst on resume.
         let mut discovery_refresh_tick = tokio::time::interval(Duration::from_secs(30));
         discovery_refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // skip the immediate-fire of the first tick — Discovery
         // already published once at startup
         discovery_refresh_tick.tick().await;
+        let mut pairing_tick = tokio::time::interval(Duration::from_secs(2));
+        pairing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut clipboard_tick = tokio::time::interval(Duration::from_millis(25));
+        clipboard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            if self.shutdown_requested {
+                break;
+            }
             tokio::select! {
+                _ = clipboard_tick.tick(), if self.clipboard.is_some() => self.clipboard_step().await,
+                _ = pairing_tick.tick() => self.refresh_pairing().await,
                 request = self.frontend_listener.next() => self.handle_frontend_request(request).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
@@ -362,10 +420,8 @@ impl Service {
                     self.handle_discovery_event(event)
                 }
                 _ = self.config.changed() => self.handle_config_change().await,
-                _ = discovery_refresh_tick.tick() => self.on_discovery_refresh().await,
-                event = recv_clipboard(&mut self.clipboard_monitor) => {
-                    self.handle_local_clipboard_event(event).await;
-                }
+                _ = discovery_refresh_tick.tick() => self.network_refresh.request(NetworkSnapshot::query),
+                result = self.network_refresh.event() => self.on_network_snapshot(result).await,
                 result = shutdown_signal() => break result?,
             }
         }
@@ -383,6 +439,119 @@ impl Service {
         Ok(())
     }
 
+    fn rebuild_clipboard_policy(&mut self) {
+        let policy = self.config.clipboard_suppression();
+        let replacement = policy
+            .host()
+            .iter()
+            .cloned()
+            .map(mousehop_ipc::host_app_ident)
+            .collect();
+        match self.clipboard_suppression.lock() {
+            Ok(mut suppression) => *suppression = replacement,
+            Err(_) => log::warn!("clipboard suppression policy lock is poisoned"),
+        }
+    }
+
+    async fn clipboard_step(&mut self) {
+        #[cfg(not(any(windows, target_os = "macos")))]
+        return;
+
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let mut current: Vec<_> = self
+                .conn
+                .clipboard_snapshot()
+                .await
+                .into_iter()
+                .map(|(fp, session, conn)| {
+                    (
+                        fp,
+                        LaneKey {
+                            inbound: false,
+                            session,
+                        },
+                        conn,
+                    )
+                })
+                .collect();
+            current.extend(self.clipboard_owner.snapshot().await.into_iter().map(
+                |(fp, session, conn)| {
+                    (
+                        fp,
+                        LaneKey {
+                            inbound: true,
+                            session,
+                        },
+                        conn,
+                    )
+                },
+            ));
+            let authorized = self.authorized_keys.read().expect("lock").clone();
+            let pinned: HashSet<_> = self
+                .client_manager
+                .clients()
+                .iter()
+                .filter_map(|(client, _)| client.expected_fingerprint.clone())
+                .collect();
+            let enabled = self.config.clipboard_sync();
+            current.retain(|(fingerprint, key, _)| {
+                clipboard_peer_allowed(enabled, key.inbound, fingerprint, &authorized, &pinned)
+            });
+            let current: Vec<_> = current.into_iter().take(MAX_CLIPBOARD_PEERS).collect();
+            let present: HashSet<_> = current
+                .iter()
+                .map(|(fingerprint, key, _)| (fingerprint.clone(), *key))
+                .collect();
+            let Some(clipboard) = self.clipboard.as_mut() else {
+                return;
+            };
+            let stale: Vec<_> = clipboard
+                .lanes()
+                .into_iter()
+                .filter(|entry| !present.contains(entry))
+                .map(|(_, key)| key)
+                .collect();
+            for key in stale {
+                clipboard.detach_lane(key);
+            }
+            for (fingerprint, key, conn) in current {
+                if !clipboard.contains(key) {
+                    if let Some(lane) = crate::transport::clipboard_lane(&conn) {
+                        let context = SessionContext {
+                            session_epoch: key.session,
+                            session_valid: true,
+                            authorization_epoch: 1,
+                            local_consent: Formats {
+                                text: true,
+                                png: true,
+                            },
+                            local_generation: 0,
+                        };
+                        clipboard.attach(fingerprint, key, lane, context);
+                    }
+                }
+            }
+            if !clipboard.lanes().is_empty() {
+                clipboard.tick();
+            }
+        }
+    }
+
+    fn clear_clipboard(&mut self) {
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            let peers: HashSet<_> = clipboard
+                .lanes()
+                .into_iter()
+                .map(|(peer, _)| peer)
+                .collect();
+            for peer in peers {
+                clipboard.detach_peer(&peer);
+            }
+        }
+    }
+
     async fn handle_frontend_request(
         &mut self,
         request: Option<Result<FrontendRequest, IpcError>>,
@@ -392,6 +561,220 @@ impl Service {
             Err(e) => return log::error!("error receiving request: {e}"),
         };
         match request {
+            FrontendRequest::Shutdown(token) => {
+                self.shutdown_requested |= std::env::var("MOUSEHOP_OWNER_TOKEN")
+                    .is_ok_and(|expected| !expected.is_empty() && token == expected);
+            }
+            FrontendRequest::UpdateScreenAlignment(handle, alignment) => {
+                if let Some((mut config, _)) = self.client_manager.get_state(handle) {
+                    config.alignment = alignment;
+                    self.client_manager.set_config(handle, config);
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
+            FrontendRequest::UpdateScreenPlacement(handle, pos, alignment) => {
+                if self
+                    .client_manager
+                    .set_screen_placement(handle, pos, alignment)
+                {
+                    self.deactivate_client(handle);
+                    self.activate_client(handle);
+                }
+                self.broadcast_client(handle);
+                self.save_config().await;
+            }
+            FrontendRequest::SetClientAlias(handle, alias) => {
+                let alias = match mousehop_ipc::normalize_client_alias(&alias) {
+                    Ok(alias) => alias,
+                    Err(error) => {
+                        self.notify_frontend(FrontendEvent::Error(error.into()));
+                        return;
+                    }
+                };
+                let Some((mut config, _)) = self.client_manager.get_state(handle) else {
+                    self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+                    return;
+                };
+                let before = config.clone();
+                let persisted_clients = self.config.clients();
+                config.alias = alias;
+                self.client_manager.set_config(handle, config);
+                // Confirm only after persistence; keep canonical state on failure.
+                if !self.save_config().await {
+                    self.client_manager.set_config(handle, before);
+                    self.config.set_clients(persisted_clients);
+                    self.notify_frontend(FrontendEvent::Error(
+                        "Could not save device alias; try again".into(),
+                    ));
+                }
+                self.broadcast_client(handle);
+            }
+            FrontendRequest::UpdateConnection(handle, settings) => {
+                if !settings.is_valid() {
+                    self.notify_frontend(FrontendEvent::Error(
+                        "Enter a hostname or IP address and a port from 1 to 65535".into(),
+                    ));
+                    return;
+                }
+                let Some((config, _)) = self.client_manager.get_state(handle) else {
+                    self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+                    return;
+                };
+                let hostname_changed = config.hostname != settings.hostname;
+                if !ClientConnectionConfig::from(&config).same_endpoint(&settings) {
+                    self.conn.reset_handle(handle).await;
+                }
+                self.client_manager.set_connection_config(handle, settings);
+                if hostname_changed {
+                    self.resolve(handle);
+                }
+                self.broadcast_client(handle);
+                self.save_config().await;
+            }
+            FrontendRequest::ConnectManual(host, port, position) => {
+                if host.is_empty()
+                    || host.len() > 253
+                    || host.chars().any(|c| c.is_control() || c.is_whitespace())
+                    || port == 0
+                {
+                    self.notify_frontend(FrontendEvent::Error(
+                        "Enter a hostname or IP address and a valid port".into(),
+                    ));
+                } else {
+                    let existing = self
+                        .client_manager
+                        .get_client_states()
+                        .into_iter()
+                        .find(|(_, c, _)| {
+                            c.hostname.as_deref() == Some(host.as_str()) && c.port == port
+                        })
+                        .map(|(handle, _, _)| handle);
+                    let Some(position) = self.pairing_position(existing, position) else {
+                        return;
+                    };
+                    let handle = existing.unwrap_or_else(|| self.client_manager.add_client());
+                    if existing.is_none() {
+                        self.client_manager
+                            .set_use_kcp(handle, self.config.global_kcp());
+                    } else {
+                        self.conn.reset_handle(handle).await;
+                    }
+                    if let Some((mut config, _)) = self.client_manager.get_state(handle) {
+                        config.approval_paused = false;
+                        config.approval_nonce = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        self.client_manager.set_config(handle, config);
+                    }
+                    self.client_manager.set_hostname(handle, Some(host.clone()));
+                    if let Ok(ip) = host.parse() {
+                        self.client_manager.set_fix_ips(handle, vec![ip]);
+                    }
+                    self.client_manager.set_port(handle, port);
+                    self.update_pos(handle, position);
+                    self.activate_client(handle);
+                    self.broadcast_client(handle);
+                    self.pairing_dials.insert(handle, Instant::now());
+                    let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+                    self.save_config().await;
+                }
+            }
+            FrontendRequest::SetDiscoveryEmail(value) => match normalize_email(&value) {
+                Ok(email) => {
+                    let changed = self.config.discovery_email() != email;
+                    self.config.set_discovery_email(email.clone());
+                    self.discovery
+                        .set_identity(email.as_deref(), &self.public_key_fingerprint);
+                    if changed {
+                        self.nearby.clear();
+                        self.pairing_requests.clear();
+                    }
+                    self.notify_frontend(FrontendEvent::DiscoveryEmail(email));
+                    self.publish_nearby();
+                    self.publish_pairing();
+                    self.save_config().await;
+                }
+                Err(error) => self.notify_frontend(FrontendEvent::Error(error.into())),
+            },
+            FrontendRequest::RetryApproval(handle) => {
+                let Some((mut config, _)) = self.client_manager.get_state(handle) else {
+                    return;
+                };
+                if !config.approval_paused {
+                    return;
+                }
+                self.conn.reset_handle(handle).await;
+                config.approval_paused = false;
+                config.approval_nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                self.client_manager.set_config(handle, config);
+                self.activate_client(handle);
+                self.pairing_dials.insert(handle, Instant::now());
+                self.broadcast_client(handle);
+                self.save_config().await;
+                let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+            }
+            FrontendRequest::ConnectDiscovered(id, position) => {
+                self.connect_discovered(&id, position).await;
+            }
+            FrontendRequest::RespondPairing(id, approve) => {
+                if let Some((request, seen)) = self.pairing_requests.remove(&id) {
+                    if seen.elapsed() < Duration::from_secs(60) {
+                        if let Some((fingerprint, nonce)) = id
+                            .rsplit_once('@')
+                            .and_then(|(fp, n)| n.parse::<u64>().ok().map(|n| (fp.to_owned(), n)))
+                        {
+                            if !self.admissions.is_pending(&fingerprint, nonce) {
+                                self.publish_pairing();
+                                return;
+                            }
+                            if approve {
+                                let mut keys = self.authorized_keys.read().expect("lock").clone();
+                                keys.insert(
+                                    fingerprint.clone(),
+                                    IncomingPeerConfig {
+                                        description: request.name.clone(),
+                                        ..Default::default()
+                                    },
+                                );
+                                self.config.set_authorized_keys(keys);
+                                if self.config.write_back().await.is_err() {
+                                    self.admissions.respond(
+                                        &fingerprint,
+                                        nonce,
+                                        crate::approval::Decision::Denied,
+                                    );
+                                    self.publish_pairing();
+                                    return;
+                                }
+                                if !self.admissions.is_pending(&fingerprint, nonce) {
+                                    self.config.set_authorized_keys(
+                                        self.authorized_keys.read().expect("lock").clone(),
+                                    );
+                                    self.config.write_back().await.ok();
+                                    self.publish_pairing();
+                                    return;
+                                }
+                                self.add_authorized_key(request.name, fingerprint.clone());
+                            }
+                            self.admissions.respond(
+                                &fingerprint,
+                                nonce,
+                                if approve {
+                                    crate::approval::Decision::Approved
+                                } else {
+                                    crate::approval::Decision::Denied
+                                },
+                            );
+                        }
+                    }
+                }
+                self.publish_pairing();
+            }
             FrontendRequest::Activate(handle, active) => {
                 self.set_client_active(handle, active);
                 self.save_config().await;
@@ -434,13 +817,16 @@ impl Service {
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
+                self.clear_clipboard();
                 self.remove_authorized_key(key);
                 self.save_config().await;
             }
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
                 self.update_enter_hook(handle, enter_hook)
             }
-            FrontendRequest::SaveConfiguration => self.save_config().await,
+            FrontendRequest::SaveConfiguration => {
+                self.save_config().await;
+            }
             FrontendRequest::SetReleaseThreshold(threshold) => {
                 self.config.set_release_threshold_px(threshold);
                 self.capture.set_release_threshold(threshold);
@@ -465,11 +851,94 @@ impl Service {
             FrontendRequest::SetMdnsDiscovery(enabled) => {
                 self.config.set_mdns_discovery(enabled);
                 self.discovery.set_enabled(enabled);
+                if !enabled {
+                    self.nearby.clear();
+                    self.publish_nearby();
+                }
                 self.notify_frontend(FrontendEvent::MdnsDiscovery(enabled));
                 self.save_config().await;
             }
-            FrontendRequest::SetClientClipboardSend(handle, enabled) => {
-                if self.client_manager.set_clipboard_send(handle, enabled) {
+            FrontendRequest::SetClipboardDeviceGrant(..) => {
+                self.notify_frontend(FrontendEvent::Error(
+                    "Clipboard sync is configured globally".into(),
+                ));
+            }
+            FrontendRequest::SetClientClipboardSend(..)
+            | FrontendRequest::SetIncomingPeerClipboardReceive(..) => {
+                self.notify_frontend(FrontendEvent::Error(
+                    "Directional clipboard permissions are no longer supported".into(),
+                ));
+            }
+            FrontendRequest::SetGlobalKcp(enabled) => {
+                self.config.set_global_kcp(enabled);
+                for handle in self.client_manager.registered_clients() {
+                    self.client_manager.set_use_kcp(handle, enabled);
+                    self.broadcast_client(handle);
+                }
+                self.notify_frontend(FrontendEvent::GlobalKcp(enabled));
+                self.save_config().await;
+            }
+            FrontendRequest::SetClipboardSync(enabled) => {
+                if !enabled {
+                    self.clear_clipboard();
+                }
+                let previous = self.config.clipboard_sync();
+                self.config.set_clipboard_sync(enabled);
+                if !self.save_config().await {
+                    self.config.set_clipboard_sync(enabled && previous);
+                    self.notify_frontend(FrontendEvent::Error(
+                        "Could not save clipboard sync setting".into(),
+                    ));
+                }
+                if enabled && !previous && self.config.clipboard_sync() {
+                    // Detached clipboard lanes are one-shot; fresh DTLS sessions own fresh lanes.
+                    for handle in self.client_manager.registered_clients() {
+                        let released = self.capture.release_client(handle).await;
+                        self.conn.reset_handle(handle).await;
+                        if !released {
+                            self.deactivate_client(handle);
+                        } else if self
+                            .client_manager
+                            .get_state(handle)
+                            .is_some_and(|(_, state)| state.active)
+                        {
+                            let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+                        }
+                    }
+                    for (_, _, conn) in self.clipboard_owner.snapshot().await {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), conn.close()).await;
+                    }
+                }
+                self.notify_frontend(FrontendEvent::ClipboardSync(self.config.clipboard_sync()));
+            }
+            FrontendRequest::SetClientUseKcp(..) => {
+                self.notify_frontend(FrontendEvent::Error("KCP is configured globally".into()));
+            }
+            FrontendRequest::SetClientScrollInertia(handle, enabled) => {
+                if self.client_manager.get_state(handle).is_some() {
+                    if self.client_manager.set_scroll_inertia(handle, enabled) {
+                        let released = self.capture.release_client(handle).await;
+                        self.conn.reset_handle(handle).await;
+                        self.client_manager.set_transport_status(
+                            handle,
+                            if released {
+                                "Disconnected"
+                            } else {
+                                "Failed: input release not confirmed"
+                            },
+                        );
+                        if !released {
+                            self.deactivate_client(handle);
+                        }
+                        if released
+                            && self
+                                .client_manager
+                                .get_state(handle)
+                                .is_some_and(|(_, s)| s.active)
+                        {
+                            let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+                        }
+                    }
                     self.broadcast_client(handle);
                     self.save_config().await;
                 }
@@ -500,45 +969,21 @@ impl Service {
                     self.save_config().await;
                 }
             }
-            FrontendRequest::SetConnectionMode(handle, mode) => {
-                // Resolve the live network first: the user is acting on a
-                // connected machine, so a stale cached `None` (from a
-                // transient blip) must not leave this network's lock in
-                // place to silently re-activate later.
-                self.refresh_network().await;
-                let net = self.current_network.clone();
-                if self.client_manager.set_mode(handle, mode, net.as_deref()) {
-                    // The mode change may have cleared this network's
-                    // lock; re-resolve and re-dial so the new policy
-                    // takes effect immediately.
-                    self.client_manager
-                        .recompute_active_lock(handle, net.as_deref());
-                    self.conn.reset_handle(handle).await;
-                    self.broadcast_client(handle);
-                    self.save_config().await;
-                }
-            }
-            FrontendRequest::SetNetworkLock(handle, ip) => {
-                // Resolve the live network first (see SetConnectionMode).
-                self.refresh_network().await;
-                let Some(net) = self.current_network.clone() else {
-                    log::warn!("cannot lock client {handle}: current network unknown");
+            request @ (FrontendRequest::SetConnectionMode(handle, _)
+            | FrontendRequest::SetNetworkLock(handle, _)) => {
+                if self.client_manager.get_state(handle).is_none() {
+                    self.notify_frontend(FrontendEvent::NoSuchClient(handle));
                     return;
-                };
-                if self.client_manager.set_network_lock(handle, &net, ip) {
-                    self.client_manager
-                        .recompute_active_lock(handle, Some(&net));
-                    // Drop any live connection so the lock takes effect
-                    // on the next event instead of waiting for the
-                    // current (possibly wrong-interface) path to drop.
-                    self.conn.reset_handle(handle).await;
-                    self.broadcast_client(handle);
-                    self.save_config().await;
                 }
-            }
-            FrontendRequest::SetIncomingPeerClipboardReceive(fp, enabled) => {
-                self.set_incoming_peer_clipboard_receive(fp, enabled);
-                self.save_config().await;
+                // Wait for a fresh fingerprint without parking input dispatch.
+                if self.pending_network_requests.len() < 32 {
+                    self.pending_network_requests.push_back(request);
+                    self.network_refresh.request(NetworkSnapshot::query);
+                } else {
+                    self.notify_frontend(FrontendEvent::Error(
+                        "network query busy; retry the change".into(),
+                    ));
+                }
             }
             FrontendRequest::AddSuppressedApp(value) => {
                 self.add_suppressed_app(value);
@@ -576,20 +1021,11 @@ impl Service {
         self.commit_suppression(suppression);
     }
 
-    /// Persist the per-OS struct, refresh the runtime `HashSet`
-    /// shared with [`ClipboardMonitor`], and push the host slot to
-    /// the GUI. Centralized so add/remove can't drift apart.
+    /// Persist privacy preferences and publish the current host's app list.
     fn commit_suppression(&mut self, suppression: mousehop_ipc::ClipboardSuppression) {
-        let host = HostKind::current();
         let host_list = suppression.host().clone();
-        {
-            let mut guard = self.clipboard_suppression.lock().expect("lock");
-            guard.clear();
-            for s in &host_list {
-                guard.insert(host.make_ident(s.clone()));
-            }
-        }
         self.config.set_clipboard_suppression(suppression);
+        self.rebuild_clipboard_policy();
         self.notify_frontend(FrontendEvent::SuppressedAppsUpdated(host_list));
     }
 
@@ -669,31 +1105,16 @@ impl Service {
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
-    fn set_incoming_peer_clipboard_receive(
-        &mut self,
-        fingerprint: String,
-        clipboard_receive: bool,
-    ) {
-        if let Some(peer) = self
-            .authorized_keys
-            .write()
-            .expect("lock")
-            .get_mut(&fingerprint)
-        {
-            peer.clipboard_receive = clipboard_receive;
-        }
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        // Emulation needs to know so the receive-side gate matches
-        // the new value immediately, not after a config-change cycle.
-        self.emulation.set_incoming_peers(keys.clone());
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
-    }
-
-    async fn save_config(&mut self) {
+    async fn save_config(&mut self) -> bool {
         let clients = self.client_manager.clients();
         let clients = clients
             .into_iter()
             .map(|(c, s)| ConfigClient {
+                alias: c.alias,
+                expected_fingerprint: c.expected_fingerprint,
+                approval_paused: c.approval_paused,
+                approval_nonce: c.approval_nonce,
+                alignment: c.alignment,
                 ips: HashSet::from_iter(c.fix_ips),
                 hostname: c.hostname,
                 port: c.port,
@@ -704,6 +1125,8 @@ impl Service {
                 network_locks: c.network_locks,
                 clipboard_send: c.clipboard_send,
                 command_as_ctrl: c.command_as_ctrl,
+                use_kcp: c.use_kcp,
+                scroll_inertia: c.scroll_inertia,
                 require_crossing_modifier: c.require_crossing_modifier,
                 crossing_modifier: c.crossing_modifier,
             })
@@ -713,10 +1136,20 @@ impl Service {
         self.config.set_authorized_keys(authorized_keys);
         if let Err(e) = self.config.write_back().await {
             log::warn!("failed to write config: {e}");
+            return false;
         }
+        true
     }
 
     async fn handle_config_change(&mut self) {
+        self.clear_clipboard();
+        self.nearby.clear();
+        self.pairing_requests.clear();
+        self.discovery.set_enabled(self.config.mdns_discovery());
+        self.discovery.set_identity(
+            self.config.discovery_email().as_deref(),
+            &self.public_key_fingerprint,
+        );
         for h in self.client_manager.registered_clients() {
             self.remove_client(h).await;
         }
@@ -753,7 +1186,25 @@ impl Service {
     async fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
+                // The fingerprint here came from DTLS, not from the mDNS claim.
+                // A matching advertisement supplies only the human-readable name.
+                if !self.rejected_pairing.contains_key(&fingerprint)
+                    && !self.pairing_requests.contains_key(&fingerprint)
+                    && self.pairing_requests.len() < 32
+                {
+                    let device = self.nearby.by_fingerprint(&fingerprint);
+                    let request = PairingRequest {
+                        id: fingerprint.clone(),
+                        name: device
+                            .as_ref()
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| "Nearby device".into()),
+                        addresses: device.map(|d| d.addresses).unwrap_or_default(),
+                    };
+                    self.pairing_requests
+                        .insert(fingerprint, (request, Instant::now()));
+                    self.publish_pairing();
+                }
             }
             EmulationEvent::Entered {
                 addr,
@@ -761,6 +1212,14 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                if !self
+                    .authorized_keys
+                    .read()
+                    .expect("lock")
+                    .contains_key(&fingerprint)
+                {
+                    return;
+                }
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, session, pos, fingerprint.clone());
@@ -784,9 +1243,10 @@ impl Service {
                     return;
                 }
                 self.mark_remote_host_unavailable(addr);
-                if let Some(addr) = self.remove_incoming(addr, session) {
-                    self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
-                }
+                self.remove_incoming(addr, session);
+                // A peer can disconnect before ever crossing onto this
+                // screen, so it need not have created an incoming barrier.
+                self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
             }
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
@@ -813,6 +1273,14 @@ impl Service {
                 session,
                 fingerprint,
             } => {
+                if !self
+                    .authorized_keys
+                    .read()
+                    .expect("lock")
+                    .contains_key(&fingerprint)
+                {
+                    return;
+                }
                 // Accept itself replaces an inbound transport generation. If
                 // the previous generation had already created a return
                 // barrier, retire it now rather than waiting for the new peer
@@ -867,143 +1335,43 @@ impl Service {
                     });
                 }
             }
-            EmulationEvent::ClipboardReceived {
-                addr,
-                from_fingerprint,
-                content,
-            } => {
-                self.handle_clipboard_received(addr, from_fingerprint, content)
-                    .await;
-            }
         }
-    }
-
-    /// Local clipboard change picked up by the polling
-    /// [`ClipboardMonitor`]. Stamp the originator fingerprint on the
-    /// wire frame and fan out to every active outgoing client whose
-    /// `clipboard_send` is true. Records `(self_fp, hash)` in
-    /// `recent_forwarded` so a later forwarded copy of the same
-    /// content (re-arriving via another peer in an N-peer ring)
-    /// won't be redundantly re-broadcast.
-    async fn handle_local_clipboard_event(&mut self, event: Option<input_capture::CaptureEvent>) {
-        let Some(event) = event else {
-            return;
-        };
-        let input_capture::CaptureEvent::Input(InputEvent::Clipboard(ClipboardEvent::Text(
-            content,
-        ))) = event
-        else {
-            return;
-        };
-        let targets = self.client_manager.clipboard_send_targets();
-        if targets.is_empty() {
-            log::trace!(
-                "clipboard captured locally ({} bytes) but no peer has clipboard_send=true; skipping fan-out",
-                content.len()
-            );
-            return;
-        }
-        let from_fingerprint = self.public_key_fingerprint.clone();
-        let hash = clipboard_hash(&content);
-        self.prune_recent_forwarded();
-        self.recent_forwarded
-            .insert((from_fingerprint.clone(), hash), Instant::now());
-        log::info!(
-            "broadcasting local clipboard ({} bytes) to {} peer(s)",
-            content.len(),
-            targets.len()
-        );
-        for handle in targets {
-            let event = ProtoEvent::Clipboard {
-                from_fingerprint: from_fingerprint.clone(),
-                content: content.clone(),
-            };
-            if let Err(e) = self.conn.send(event, handle).await {
-                log::debug!("clipboard send to client {handle} failed: {e}");
-            }
-        }
-    }
-
-    /// Forwarded clipboard frame just landed via the listen side
-    /// (the local clipboard has already been updated by
-    /// `emulation::ListenTask`). Refresh the
-    /// [`ClipboardMonitor`]'s last-known content so the next 500ms
-    /// poll doesn't see this as a fresh local change and bounce it
-    /// back, then forward to other peers honoring the recent-
-    /// forwarded gate.
-    async fn handle_clipboard_received(
-        &mut self,
-        from_addr: SocketAddr,
-        from_fingerprint: String,
-        content: String,
-    ) {
-        if let Some(monitor) = self.clipboard_monitor.as_ref() {
-            monitor.update_last_content(content.clone());
-        }
-        let hash = clipboard_hash(&content);
-        self.prune_recent_forwarded();
-        let key = (from_fingerprint.clone(), hash);
-        if self.recent_forwarded.contains_key(&key) {
-            log::debug!(
-                "skipping clipboard re-fan-out: already forwarded ({}, {} bytes) within {}ms",
-                &from_fingerprint[..from_fingerprint.len().min(8)],
-                content.len(),
-                RECENT_FORWARD_TTL.as_millis()
-            );
-            return;
-        }
-        let targets = self.client_manager.clipboard_send_targets();
-        let forward_targets: Vec<ClientHandle> = targets
-            .into_iter()
-            .filter(|h| {
-                // Skip the client we just received from. Identified
-                // by IP rather than full SocketAddr so a peer's
-                // ephemeral source port (which differs between its
-                // outgoing and our cached active_addr) doesn't
-                // accidentally include them.
-                self.client_manager
-                    .active_addr(*h)
-                    .map(|a| a.ip() != from_addr.ip())
-                    .unwrap_or(true)
-            })
-            .collect();
-        if forward_targets.is_empty() {
-            return;
-        }
-        self.recent_forwarded.insert(key, Instant::now());
-        log::info!(
-            "forwarding clipboard ({} bytes, originator {}) to {} peer(s)",
-            content.len(),
-            &from_fingerprint[..from_fingerprint.len().min(8)],
-            forward_targets.len()
-        );
-        for handle in forward_targets {
-            let event = ProtoEvent::Clipboard {
-                from_fingerprint: from_fingerprint.clone(),
-                content: content.clone(),
-            };
-            if let Err(e) = self.conn.send(event, handle).await {
-                log::debug!("clipboard forward to client {handle} failed: {e}");
-            }
-        }
-    }
-
-    fn prune_recent_forwarded(&mut self) {
-        self.recent_forwarded
-            .retain(|_, ts| ts.elapsed() < RECENT_FORWARD_TTL);
     }
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
+            ICaptureEvent::LocalDisplaySize(size) => {
+                self.local_display_size = size;
+                self.notify_frontend(FrontendEvent::LocalDisplaySize(size));
+            }
+            ICaptureEvent::HostInputState(input_capture::HostInputState::Unlocked) => {
+                log::info!("host unlocked; re-enabling input emulation");
+                self.emulation.reenable();
+            }
+            ICaptureEvent::HostInputState(input_capture::HostInputState::Locked) => {}
+            ICaptureEvent::ClipboardFocusOut { handle } => {
+                // Outgoing focus triggers are deliberately separate from
+                // ClientEntered: a same-handle re-entry is still a new focus.
+                log::debug!("clipboard focus-out trigger for handle {handle}");
+                self.clipboard_focus_out(handle);
+            }
             ICaptureEvent::CaptureBegin { handle, handover } => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
-                if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation
-                        .send_leave_event(incoming.addr, incoming.session, handover);
+                if let Some((addr, session)) = self
+                    .incoming_conn_info
+                    .get(&handle)
+                    .map(|incoming| (incoming.addr, incoming.session))
+                {
+                    // The EnterOnly return path is the inbound focus trigger.
+                    // The handle is scoped to this authenticated connection.
+                    self.clipboard_focus_out_incoming(handle);
+                    self.emulation.send_leave_event(addr, session, handover);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
+                self.local_display_size = None;
+                self.notify_frontend(FrontendEvent::LocalDisplaySize(None));
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
@@ -1021,6 +1389,36 @@ impl Service {
         }
     }
 
+    fn clipboard_focus_out(&mut self, handle: ClientHandle) {
+        let Some(fingerprint) = self.client_manager.expected_fingerprint(handle) else {
+            log::debug!("clipboard focus-out has no fingerprint for outbound handle {handle}");
+            return;
+        };
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = fingerprint;
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            clipboard.focus_out(&fingerprint);
+        }
+    }
+
+    fn clipboard_focus_out_incoming(&mut self, handle: ClientHandle) {
+        let Some(fingerprint) = self
+            .incoming_conn_info
+            .get(&handle)
+            .map(|incoming| incoming.fingerprint.clone())
+        else {
+            log::debug!("clipboard focus-out has no fingerprint for incoming handle {handle}");
+            return;
+        };
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = fingerprint;
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            clipboard.focus_out(&fingerprint);
+        }
+    }
+
     fn handle_resolver_event(&mut self, event: DnsEvent) {
         let handle = match event {
             DnsEvent::Resolving(handle) => {
@@ -1028,12 +1426,15 @@ impl Service {
                 handle
             }
             DnsEvent::Resolved(handle, hostname, ips) => {
-                self.client_manager.set_resolving(handle, false);
+                if self.client_manager.get_hostname(handle).as_deref() != Some(hostname.as_str()) {
+                    return;
+                }
                 if let Err(e) = &ips {
                     log::warn!("could not resolve {hostname}: {e}");
                 }
                 let ips = ips.unwrap_or_default();
-                self.client_manager.set_dns_ips(handle, ips);
+                self.client_manager
+                    .accept_dns_result(handle, &hostname, ips);
                 handle
             }
         };
@@ -1095,16 +1496,203 @@ impl Service {
         }
     }
 
+    fn publish_nearby(&mut self) {
+        self.notify_frontend(FrontendEvent::NearbyDevices(self.nearby.snapshot()));
+    }
+
+    fn publish_pairing(&mut self) {
+        let mut requests: Vec<_> = self
+            .pairing_requests
+            .values()
+            .map(|(r, _)| r.clone())
+            .collect();
+        requests.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        self.notify_frontend(FrontendEvent::PairingRequests(requests));
+    }
+
+    async fn refresh_pairing(&mut self) {
+        let pending = self.admissions.pending();
+        let ids: HashSet<_> = pending.iter().map(|(fp, n)| format!("{fp}@{n}")).collect();
+        self.pairing_requests.retain(|id, _| ids.contains(id));
+        for (fingerprint, nonce) in pending {
+            let id = format!("{fingerprint}@{nonce}");
+            if !self.pairing_requests.contains_key(&id) {
+                let device = self.nearby.by_fingerprint(&fingerprint);
+                self.pairing_requests.insert(
+                    id.clone(),
+                    (
+                        PairingRequest {
+                            id,
+                            name: device
+                                .as_ref()
+                                .map(|d| d.name.clone())
+                                .unwrap_or_else(|| "Nearby device".into()),
+                            addresses: device.map(|d| d.addresses).unwrap_or_default(),
+                        },
+                        Instant::now(),
+                    ),
+                );
+            }
+        }
+        self.publish_pairing();
+        let before = self.pairing_requests.len();
+        self.pairing_requests
+            .retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(60));
+        self.rejected_pairing
+            .retain(|_, seen| seen.elapsed() < Duration::from_secs(60));
+        if before != self.pairing_requests.len() {
+            self.publish_pairing();
+        }
+        let handles: Vec<_> = self.pairing_dials.keys().copied().collect();
+        let mut save_paused = false;
+        for handle in handles {
+            if self.pairing_dials[&handle].elapsed() >= Duration::from_secs(60)
+                || self
+                    .client_manager
+                    .get_state(handle)
+                    .is_some_and(|(c, _)| c.approval_paused)
+                || self.client_manager.alive(handle)
+                || self.client_manager.get_state(handle).is_none()
+            {
+                self.pairing_dials.remove(&handle);
+                save_paused = true;
+            } else {
+                // send() initiates a bounded background handshake; it does not
+                // park the input-dispatch loop waiting for user approval.
+                let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+            }
+        }
+        let paused: Vec<_> = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .filter(|(_, c, s)| c.approval_paused && s.active)
+            .map(|(h, _, _)| h)
+            .collect();
+        for handle in paused {
+            self.set_client_active(handle, false);
+            self.broadcast_client(handle);
+            save_paused = true;
+        }
+        if save_paused {
+            self.save_config().await;
+        }
+    }
+
+    async fn connect_discovered(&mut self, id: &str, position: Position) {
+        let Some(device) = self.nearby.get(id) else {
+            self.notify_frontend(FrontendEvent::Error("Device is no longer nearby".into()));
+            return;
+        };
+        let existing = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .find(|(_, c, _)| {
+                c.hostname.as_deref() == Some(device.hostname.as_str()) && c.port == device.port
+            })
+            .map(|(h, _, _)| h);
+        let Some(position) = self.pairing_position(existing, position) else {
+            return;
+        };
+        let handle = existing.unwrap_or_else(|| self.client_manager.add_client());
+        if let Some(expected) = self.client_manager.expected_fingerprint(handle) {
+            if expected != device.fingerprint {
+                self.notify_frontend(FrontendEvent::Error(
+                    "Device identity changed. Remove the saved computer before reconnecting".into(),
+                ));
+                return;
+            }
+        }
+        if existing.is_none() {
+            self.client_manager
+                .set_use_kcp(handle, self.config.global_kcp());
+        }
+        if existing.is_some() {
+            self.conn.reset_handle(handle).await;
+        }
+        if let Some((mut config, _)) = self.client_manager.get_state(handle) {
+            config.expected_fingerprint = Some(device.fingerprint);
+            config.approval_paused = false;
+            config.approval_nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            self.client_manager.set_config(handle, config);
+        }
+        self.client_manager
+            .set_hostname(handle, Some(device.hostname));
+        self.client_manager.set_fix_ips(handle, device.addresses);
+        self.client_manager.set_port(handle, device.port);
+        self.update_pos(handle, position);
+        self.activate_client(handle);
+        self.broadcast_client(handle);
+        self.pairing_dials.insert(handle, Instant::now());
+        let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+        self.save_config().await;
+    }
+
+    fn pairing_position(
+        &mut self,
+        existing: Option<ClientHandle>,
+        preferred: Position,
+    ) -> Option<Position> {
+        let position = existing
+            .and_then(|handle| self.client_manager.get_pos(handle))
+            .or_else(|| {
+                [
+                    preferred,
+                    Position::Left,
+                    Position::Right,
+                    Position::Top,
+                    Position::Bottom,
+                ]
+                .into_iter()
+                .find(|p| self.client_manager.client_at(*p).is_none())
+            });
+        if position.is_none() {
+            self.notify_frontend(FrontendEvent::Error(
+                "All four screen edges are in use; arrange or disconnect a computer first".into(),
+            ));
+        }
+        position
+    }
+
     /// Fold a resolved peer advertisement into every client whose
     /// configured hostname matches the mDNS instance: add the
     /// discovered addresses to the candidate set and record per-address
     /// interface kinds. Re-broadcasts only the clients that changed.
     fn handle_discovery_event(&mut self, event: DiscoveryEvent) {
+        if let DiscoveryEvent::Removed(id) = &event {
+            self.nearby.remove(id);
+            self.publish_nearby();
+            return;
+        }
         let DiscoveryEvent::Resolved {
             instance,
             addresses,
             interfaces,
-        } = event;
+            group,
+            device,
+        } = event
+        else {
+            return;
+        };
+        if self.config.mdns_discovery()
+            && self
+                .config
+                .discovery_email()
+                .is_some_and(|email| group.as_deref() == Some(email_group(&email).as_str()))
+            && device.fingerprint != self.public_key_fingerprint
+            && !device.fingerprint.is_empty()
+            && !device.addresses.is_empty()
+            && device.port != 0
+        {
+            self.nearby.upsert(*device);
+        } else {
+            self.nearby.remove(&device.id);
+        }
+        self.publish_nearby();
         for handle in self.client_manager.registered_clients() {
             let matches = self
                 .client_manager
@@ -1134,19 +1722,73 @@ impl Service {
         }
     }
 
-    /// Periodic discovery housekeeping: re-publish our advertisement
-    /// (primary interface may have changed) and re-evaluate which
-    /// network we're on for per-network lock resolution.
-    async fn on_discovery_refresh(&mut self) {
-        self.discovery.refresh();
-        self.refresh_network().await;
+    async fn on_network_snapshot(
+        &mut self,
+        result: Result<Result<NetworkSnapshot, &'static str>, tokio::task::JoinError>,
+    ) {
+        let network = match result {
+            Ok(Ok(network)) => network,
+            result => {
+                log::warn!("network query failed; retaining last snapshot: {result:?}");
+                if !self.pending_network_requests.is_empty() {
+                    self.pending_network_requests.clear();
+                    self.notify_frontend(FrontendEvent::Error(
+                        "network query failed; retry the change".into(),
+                    ));
+                }
+                return;
+            }
+        };
+        let net = network.network_id.clone();
+        self.discovery.refresh(network);
+        self.refresh_network(net).await;
+        while let Some(request) = self.pending_network_requests.pop_front() {
+            self.apply_network_request(request).await;
+        }
+    }
+
+    async fn apply_network_request(&mut self, request: FrontendRequest) {
+        match request {
+            FrontendRequest::SetConnectionMode(handle, mode) => {
+                let net = self.current_network.clone();
+                if self.client_manager.set_mode(handle, mode, net.as_deref()) {
+                    // The mode change may have cleared this network's
+                    // lock; re-resolve and re-dial so the new policy
+                    // takes effect immediately.
+                    self.client_manager
+                        .recompute_active_lock(handle, net.as_deref());
+                    self.conn.reset_handle(handle).await;
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
+            FrontendRequest::SetNetworkLock(handle, ip) => {
+                let Some(net) = self.current_network.clone() else {
+                    log::warn!("cannot lock client {handle}: current network unknown");
+                    self.notify_frontend(FrontendEvent::Error(
+                        "Cannot pin address: the current network is unknown".into(),
+                    ));
+                    return;
+                };
+                if self.client_manager.set_network_lock(handle, &net, ip) {
+                    self.client_manager
+                        .recompute_active_lock(handle, Some(&net));
+                    // Drop any live connection so the lock takes effect
+                    // on the next event instead of waiting for the
+                    // current (possibly wrong-interface) path to drop.
+                    self.conn.reset_handle(handle).await;
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
+            _ => unreachable!("only network policy requests are deferred"),
+        }
     }
 
     /// Recompute the current-network fingerprint. On change, re-resolve
     /// every client's active lock and re-dial those whose lock moved so
     /// the new network's pin (or its absence) takes effect at once.
-    async fn refresh_network(&mut self) {
-        let net = current_network_id();
+    async fn refresh_network(&mut self, net: Option<String>) {
         if net == self.current_network {
             return;
         }
@@ -1164,6 +1806,18 @@ impl Service {
     }
 
     fn sync_frontend(&mut self) {
+        self.notify_frontend(FrontendEvent::LocalDeviceName(
+            crate::discovery::local_device_name(),
+        ));
+        self.notify_frontend(FrontendEvent::LocalDisplaySize(self.local_display_size));
+        self.notify_frontend(FrontendEvent::ServiceIdentity {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            ipc_version: mousehop_ipc::NATIVE_FRONTEND_IPC_VERSION,
+        });
+        self.notify_frontend(FrontendEvent::DiscoveryEmail(self.config.discovery_email()));
+        self.publish_nearby();
+        self.publish_pairing();
         self.enumerate();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
@@ -1176,8 +1830,13 @@ impl Service {
         ));
         self.notify_frontend(FrontendEvent::ReleaseBind(self.config.release_bind()));
         self.notify_frontend(FrontendEvent::MdnsDiscovery(self.config.mdns_discovery()));
+        self.notify_frontend(FrontendEvent::GlobalKcp(self.config.global_kcp()));
+        self.notify_frontend(FrontendEvent::ClipboardSync(self.config.clipboard_sync()));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_frontend(FrontendEvent::ClipboardDeviceGrants(
+            self.config.clipboard_device_grants(),
+        ));
         let host_list = self.config.clipboard_suppression().host().clone();
         self.notify_frontend(FrontendEvent::SuppressedAppsUpdated(host_list));
         let recovery_events: Vec<_> = self
@@ -1318,6 +1977,8 @@ impl Service {
 
     fn add_client(&mut self) {
         let handle = self.client_manager.add_client();
+        self.client_manager
+            .set_use_kcp(handle, self.config.global_kcp());
         log::info!("added client {handle}");
         let (c, s) = self.client_manager.get_state(handle).unwrap();
         self.notify_frontend(FrontendEvent::Created(handle, c, s));
@@ -1383,6 +2044,10 @@ impl Service {
     }
 
     async fn remove_client(&mut self, handle: ClientHandle) {
+        self.pairing_dials.remove(&handle);
+        // A slow query must not carry old policy into a reused Slab handle,
+        // including clients rebuilt during a configuration reload.
+        discard_network_requests_for_client(&mut self.pending_network_requests, handle);
         // Retire the exact outbound DTLS generation before Slab can reuse this
         // numeric handle for a different configured peer. The remote side
         // releases its emulation handle on connection close, and Capture gets
@@ -1467,20 +2132,6 @@ impl Service {
     }
 }
 
-/// `tokio::select!` arm helper for the optional [`ClipboardMonitor`].
-/// Resolves to `Some(event)` when the monitor surfaces a change and
-/// to a never-completing future when no monitor is alive — keeping
-/// the surrounding `select!` from busy-spinning when clipboard sync
-/// is unavailable on the host.
-async fn recv_clipboard(
-    monitor: &mut Option<ClipboardMonitor>,
-) -> Option<input_capture::CaptureEvent> {
-    match monitor.as_mut() {
-        Some(m) => m.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
 /// `tokio::select!` arm helper for the discovery event stream. Pends
 /// forever once the channel is closed so the `select!` doesn't
 /// busy-spin during shutdown.
@@ -1496,33 +2147,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clipboard_hash_is_deterministic_within_run() {
-        let h1 = clipboard_hash("hello, world");
-        let h2 = clipboard_hash("hello, world");
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn clipboard_hash_distinguishes_different_inputs() {
-        assert_ne!(clipboard_hash("foo"), clipboard_hash("bar"));
-        assert_ne!(clipboard_hash(""), clipboard_hash("\0"));
-    }
-
-    #[test]
-    fn recent_forwarded_prune_evicts_expired_entries() {
-        // Mirrors `Service::prune_recent_forwarded` so the eviction
-        // contract is documented as code rather than implicit in
-        // `HashMap::retain`.
-        let mut map: HashMap<(String, u64), Instant> = HashMap::new();
-        let now = Instant::now();
-        let stale = now
-            .checked_sub(Duration::from_secs(2))
-            .expect("clock far enough from epoch for the test to subtract 2s");
-        map.insert(("fp_a".into(), 1), stale);
-        map.insert(("fp_b".into(), 2), now);
-        map.retain(|_, ts| ts.elapsed() < RECENT_FORWARD_TTL);
-        assert!(!map.contains_key(&("fp_a".to_string(), 1)));
-        assert!(map.contains_key(&("fp_b".to_string(), 2)));
+    fn deleted_client_cannot_transfer_queued_policy_to_reused_handle() {
+        let clients = ClientManager::default();
+        let removed = clients.add_client();
+        let other = clients.add_client();
+        let mut requests = VecDeque::from([
+            FrontendRequest::SetNetworkLock(removed, "192.0.2.1".parse().unwrap()),
+            FrontendRequest::SetConnectionMode(other, ConnectionMode::default()),
+            FrontendRequest::SetConnectionMode(removed, ConnectionMode::default()),
+        ]);
+        discard_network_requests_for_client(&mut requests, removed);
+        clients.remove_client(removed);
+        assert_eq!(
+            clients.add_client(),
+            removed,
+            "exercise actual handle reuse"
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(requests.front(), Some(FrontendRequest::SetConnectionMode(handle, _)) if *handle == other)
+        );
     }
 
     #[test]
@@ -1579,5 +2223,31 @@ mod tests {
             addr,
             RemoteHostState::Unlocked,
         ));
+    }
+}
+
+#[cfg(test)]
+mod global_clipboard_policy_tests {
+    use super::*;
+
+    #[test]
+    fn only_enabled_and_directionally_trusted_peers_are_allowed() {
+        let authorized = HashMap::from([("incoming".into(), IncomingPeerConfig::default())]);
+        let pinned = HashSet::from(["outgoing".into()]);
+        for (enabled, inbound, fp, expected) in [
+            (true, true, "incoming", true),
+            (true, false, "outgoing", true),
+            (false, true, "incoming", false),
+            (false, false, "outgoing", false),
+            (true, true, "outgoing", false),
+            (true, false, "incoming", false),
+            (true, true, "unknown", false),
+            (true, false, "unknown", false),
+        ] {
+            assert_eq!(
+                clipboard_peer_allowed(enabled, inbound, fp, &authorized, &pinned),
+                expected
+            );
+        }
     }
 }

@@ -98,15 +98,15 @@
               with pkgs;
               [
                 rustToolchain
+                go
                 pkg-config
-                gtk4
-                libadwaita
                 librsvg
               ]
               ++ lib.optionals pkgs.stdenv.isLinux [
                 libX11
                 libXtst
                 dbus
+                gtk3
               ];
             env.RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
           };

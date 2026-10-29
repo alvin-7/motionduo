@@ -35,6 +35,7 @@ on:
 
 jobs:
   flatpak-build:
+    if: ${{ github.event_name != 'release' || github.event.release.prerelease == false }}
     name: Build Flatpak bundle
     runs-on: ubuntu-latest
     permissions:

@@ -2,13 +2,18 @@
   stdenv,
   rustPlatform,
   lib,
+  buildGoModule,
+  go,
+  makeWrapper,
   pkg-config,
   libX11,
-  gtk4,
-  libadwaita,
+  gtk3,
+  glib,
+  cairo,
+  gdk-pixbuf,
+  libayatana-appindicator,
   libXtst,
-  wrapGAppsHook4,
-  librsvg,
+  wrapGAppsHook3,
   git,
   dbus,
   fontconfig,
@@ -22,29 +27,42 @@ let
   rootCargoToml = fromTOML (builtins.readFile ../Cargo.toml);
   pname = appCargoToml.package.name;
   version = rootCargoToml.workspace.package.version;
+  nativeLibraries = [ gtk3 glib cairo gdk-pixbuf fontconfig libayatana-appindicator ];
+  frontend = buildGoModule {
+    pname = "mousehop-mygo";
+    inherit version;
+    src = lib.cleanSource ../mousehop-mygo;
+    vendorHash = "sha256-6E3OVpIj5ulbXO4Su17CJEYXw/gygb1cwH//RVyMUDY=";
+    subPackages = [ "." ];
+    ldflags = [ "-X main.version=${version}" ];
+    nativeBuildInputs = [ makeWrapper ];
+    buildInputs = lib.optionals stdenv.isLinux nativeLibraries;
+    doCheck = false; # Native renderer checks run in the platform CI with fonts.
+    postInstall = lib.optionalString stdenv.isLinux ''
+      wrapProgram $out/bin/mygo \
+        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath nativeLibraries}
+    '' + ''
+      mv $out/bin/mygo $out/bin/mousehop-mygo
+    '';
+  };
 in
+assert lib.assertMsg (lib.versionAtLeast go.version "1.27.3") "MyGo requires Go 1.27.3+; refresh the nixpkgs input before building this branch";
 rustPlatform.buildRustPackage {
   inherit pname;
   inherit version;
 
   nativeBuildInputs = [
     pkg-config
-    wrapGAppsHook4
+    makeWrapper
     git
-  ];
+  ] ++ lib.optionals stdenv.isLinux [ wrapGAppsHook3 ];
 
-  buildInputs = [
-    gtk4
-    libadwaita
-    librsvg
-  ]
-  ++ lib.optionals stdenv.isLinux [
+  buildInputs = lib.optionals stdenv.isLinux [
     libX11
     libXtst
     dbus
-    # `glyph_font` links libfontconfig directly to register the bundled
-    # chord-chip faces; GTK propagates it, but declare it explicitly.
     fontconfig
+    gtk3
   ];
 
   src = builtins.path {
@@ -58,8 +76,11 @@ rustPlatform.buildRustPackage {
   RUST_BACKTRACE = "full";
 
   postInstall = ''
+    makeWrapper ${frontend}/bin/mousehop-mygo $out/bin/mousehop-mygo \
+      --add-flags "--backend $out/bin/mousehop"
     install -Dm444 mousehop/*.desktop -t $out/share/applications
-    install -Dm444 mousehop-gtk/resources/*.svg -t $out/share/icons/hicolor/scalable/apps
+    install -Dm444 mousehop/assets/com.mousehop.Mousehop.svg -t $out/share/icons/hicolor/scalable/apps
+    install -Dm444 mousehop-mygo/THIRD_PARTY_NOTICES.md -t $out/share/licenses/mousehop
   '';
 
   meta = with lib; {

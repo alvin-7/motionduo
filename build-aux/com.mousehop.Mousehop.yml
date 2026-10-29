@@ -6,9 +6,10 @@ sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.llvm20
+  - org.freedesktop.Sdk.Extension.golang
 command: /app/bin/mousehop
 build-options:
-  append-path: "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin"
+  append-path: "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin:/usr/lib/sdk/golang/bin"
   prepend-ld-library-path: "/usr/lib/sdk/llvm20/lib"
   build-args:
     - "--share=network"
@@ -45,7 +46,6 @@ finish-args:
   - "--talk-name=org.freedesktop.Notifications"
   - "--env=RUST_BACKTRACE=1"
   - "--env=RUST_LOG=mousehop=debug"
-  - "--env=GTK_PATH=/app/lib/gtk-4.0"
 
 modules:
   - name: mousehop
@@ -53,14 +53,16 @@ modules:
     build-options:
       build-args:
         - "--share=network"
-      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin:/usr/lib/sdk/golang/bin
       env:
         CARGO_HOME: /run/build/mousehop/cargo
     build-commands:
       - cargo fetch --manifest-path Cargo.toml --verbose
-      - cargo build --release
+      - sh scripts/build-mygo.sh --release
+      - install -Dm0755 target/release/mousehop-mygo /app/bin/mousehop-mygo
+      - install -Dm0644 mousehop-mygo/THIRD_PARTY_NOTICES.md /app/share/licenses/mousehop/THIRD_PARTY_NOTICES.md
       - install -Dm0755 target/release/mousehop /app/bin/mousehop
-      - install -Dm0644 mousehop-gtk/resources/com.mousehop.Mousehop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      - install -Dm0644 mousehop/assets/com.mousehop.Mousehop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
       # Render a hicolor PNG ladder from the source SVG so hosts
        # that prefer fixed-size raster icons (older toolkits, certain
        # KDE variants) get a sharp render without scaling the SVG at
@@ -69,7 +71,7 @@ modules:
         for size in 16 22 24 32 48 64 128 256 512; do
           install -d ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps
           rsvg-convert -w $size -h $size \
-            mousehop-gtk/resources/com.mousehop.Mousehop.svg \
+            mousehop/assets/com.mousehop.Mousehop.svg \
             -o ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png
         done
       - install -Dm0644 mousehop/com.mousehop.Mousehop.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop

@@ -14,3 +14,11 @@ extfile.conf
 # flatpak files
 .flatpak-builder
 repo
+
+# Local investigation reports and generated packages
+/dist/
+/.drafts/
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]

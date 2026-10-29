@@ -26,7 +26,6 @@ changelog_update = true
 # CHANGELOG so a fix touching only a sibling still shows up here.
 changelog_include = [
     "mousehop-cli",
-    "mousehop-gtk",
     "mousehop-ipc",
     "mousehop-proto",
     "mousehop-input-event",

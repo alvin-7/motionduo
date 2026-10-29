@@ -29,7 +29,7 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::{connect::handshake_allows_event, crypto};
+use crate::{connect::handshake_allows_event, crypto, network::BackgroundRefresh};
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -48,13 +48,17 @@ pub(crate) type ListenerSession = u64;
 #[derive(Clone)]
 struct AcceptedConnection {
     session: ListenerSession,
+    fingerprint: String,
     conn: ArcConn,
 }
 
 #[derive(Clone, Default)]
 struct ListenerSessions {
+    recovery_available: Rc<Cell<bool>>,
     next: Rc<Cell<ListenerSession>>,
     current: Rc<RefCell<HashMap<SocketAddr, ListenerSession>>>,
+    admissions: crate::approval::Admissions,
+    authorized: Arc<RwLock<HashMap<String, IncomingPeerConfig>>>,
 }
 
 impl ListenerSessions {
@@ -84,6 +88,7 @@ impl ListenerSessions {
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
+        receipt: Option<crate::transport::Receipt>,
         addr: SocketAddr,
         session: ListenerSession,
     },
@@ -107,6 +112,7 @@ pub(crate) struct MousehopListener {
     listen_task: JoinHandle<()>,
     conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
     sessions: ListenerSessions,
+    authorized_keys: Arc<RwLock<HashMap<String, IncomingPeerConfig>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
     /// macOS-only: held for its `Drop` side effect (stops the
@@ -143,41 +149,118 @@ impl Drop for ListenerSlot {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ClipboardOwner {
+    conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
+    sessions: ListenerSessions,
+}
+impl ClipboardOwner {
+    pub(crate) async fn snapshot(&self) -> Vec<(String, ListenerSession, ArcConn)> {
+        self.conns
+            .lock()
+            .await
+            .values()
+            .filter(|slot| {
+                self.sessions
+                    .authorized
+                    .read()
+                    .is_ok_and(|keys| keys.contains_key(&slot.fingerprint))
+            })
+            .take(crate::service::MAX_CLIPBOARD_PEERS)
+            .map(|slot| (slot.fingerprint.clone(), slot.session, slot.conn.clone()))
+            .collect()
+    }
+}
+
 impl MousehopListener {
+    pub(crate) fn clipboard_owner(&self) -> ClipboardOwner {
+        ClipboardOwner {
+            conns: self.conns.clone(),
+            sessions: self.sessions.clone(),
+        }
+    }
+    #[allow(dead_code)]
+    pub(crate) async fn take_clipboard_lane(
+        &self,
+        addr: SocketAddr,
+        session: ListenerSession,
+    ) -> Option<(String, Arc<crate::transport::ClipboardLane>)> {
+        let conns = self.conns.lock().await;
+        let slot = conns.get(&addr).filter(|slot| slot.session == session)?;
+        if !self.sessions.is_current(addr, session) || !self.is_authorized(&slot.fingerprint) {
+            return None;
+        }
+        let lane = crate::transport::clipboard_lane(&slot.conn)?;
+        Some((slot.fingerprint.clone(), lane))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn revoke_clipboard_lane(&self, addr: SocketAddr, session: ListenerSession) {
+        let conns = self.conns.lock().await;
+        if let Some(slot) = conns.get(&addr).filter(|slot| slot.session == session) {
+            crate::transport::invalidate_clipboard(&slot.conn);
+        }
+    }
+
+    pub(crate) fn admissions(&self) -> crate::approval::Admissions {
+        self.sessions.admissions.clone()
+    }
+    pub(crate) fn set_recovery_available(&self, enabled: bool) {
+        self.sessions.recovery_available.set(enabled);
+    }
+
+    pub(crate) async fn recovery_links(
+        &self,
+    ) -> Vec<(
+        SocketAddr,
+        ListenerSession,
+        Arc<crate::transport::lifecycle::Link>,
+    )> {
+        self.conns
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(&addr, slot)| {
+                crate::transport::lifecycle(&slot.conn)
+                    .filter(|link| link.enabled())
+                    .map(|link| (addr, slot.session, link))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn recovery_link(
+        &self,
+        addr: SocketAddr,
+        session: ListenerSession,
+    ) -> Option<Arc<crate::transport::lifecycle::Link>> {
+        self.conns
+            .lock()
+            .await
+            .get(&addr)
+            .filter(|slot| slot.session == session)
+            .and_then(|slot| crate::transport::lifecycle(&slot.conn))
+            .filter(|link| link.enabled())
+    }
     pub(crate) async fn new(
         port: u16,
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, IncomingPeerConfig>>>,
+        kcp_timeouts: crate::transport::Timeouts,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, request_port_change_rx) = channel();
         let (port_changed_tx, port_changed) = channel();
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
 
-        let authorized = authorized_keys.clone();
         let verify_peer_certificate: Option<VerifyPeerCertificateFn> = {
-            let connection_attempts = connection_attempts.clone();
             Some(Arc::new(
                 move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
-                        Ok(())
-                    } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
-                        connection_attempts
-                            .lock()
-                            .expect("lock")
-                            .push_back(fingerprint);
-                        Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+                    if certs.len() != 1 {
+                        return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
                     }
+                    // Certificate possession is proven by DTLS. Admission is checked
+                    // before registration; accepting a certificate is NOT input authorization.
+                    Ok(())
                 },
             ))
         };
@@ -191,7 +274,10 @@ impl MousehopListener {
 
         let conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>> =
             Rc::new(AsyncMutex::new(HashMap::new()));
-        let sessions = ListenerSessions::default();
+        let sessions = ListenerSessions {
+            authorized: authorized_keys.clone(),
+            ..Default::default()
+        };
 
         // Bind one listener per local address (v4 + v6, skipping
         // loopback / link-local / multicast) instead of a single
@@ -202,7 +288,11 @@ impl MousehopListener {
         // Per-IP binds make replies symmetric automatically: each
         // listener's reply socket is bound to a specific IP, so the
         // kernel uses *that* IP as source.
-        let initial_addrs = enumerate_listenable_addrs();
+        let initial_addrs = tokio::task::spawn_blocking(enumerate_listenable_addrs)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         if initial_addrs.is_empty() {
             // Fall back to 0.0.0.0 so we at least listen somewhere if
             // interface enumeration fails (very unusual).
@@ -219,6 +309,7 @@ impl MousehopListener {
                         conns.clone(),
                         sessions.clone(),
                         connection_attempts.clone(),
+                        kcp_timeouts,
                     );
                     listeners.insert(*ip, ListenerSlot { accept_task: task });
                     bound_count += 1;
@@ -239,6 +330,7 @@ impl MousehopListener {
                         conns.clone(),
                         sessions.clone(),
                         connection_attempts.clone(),
+                        kcp_timeouts,
                     );
                     listeners.insert(fallback, ListenerSlot { accept_task: task });
                     log::info!(
@@ -272,11 +364,13 @@ impl MousehopListener {
             request_port_change_rx,
             port_changed_tx,
             wake_rx,
+            kcp_timeouts,
         );
 
         Ok(Self {
             conns,
             sessions,
+            authorized_keys,
             listen_rx,
             listen_tx,
             listen_task,
@@ -297,6 +391,38 @@ impl MousehopListener {
 
     pub(crate) fn current_session(&self, addr: SocketAddr) -> Option<ListenerSession> {
         self.sessions.current.borrow().get(&addr).copied()
+    }
+
+    pub(crate) fn is_authorized(&self, fingerprint: &str) -> bool {
+        self.authorized_keys
+            .read()
+            .expect("lock")
+            .contains_key(fingerprint)
+    }
+
+    pub(crate) async fn disconnect(&self, addr: SocketAddr, session: ListenerSession) {
+        let slot = remove_connection_if_current(&mut *self.conns.lock().await, addr, session);
+        if let Some(slot) = slot {
+            // Invalidate queued input before awaiting the transport close.
+            self.sessions.remove_if_current(addr, session);
+            let _ = self
+                .listen_tx
+                .send(ListenEvent::Disconnected { addr, session });
+            if self
+                .get_certificate_fingerprint_from_conn(&slot.conn)
+                .await
+                .is_some_and(|fp| !self.is_authorized(&fp))
+            {
+                let (bytes, len): ([u8; MAX_EVENT_SIZE], usize) =
+                    ProtoEvent::ApprovalRevoked.into();
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    crate::transport::raw(&slot.conn).send(&bytes[..len]),
+                )
+                .await;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), slot.conn.close()).await;
+        }
     }
 
     pub(crate) async fn terminate(&mut self) {
@@ -350,6 +476,17 @@ impl MousehopListener {
         }
     }
 
+    async fn get_certificate_fingerprint_from_conn(&self, conn: &ArcConn) -> Option<String> {
+        let dtls = crate::transport::raw(conn)
+            .as_any()
+            .downcast_ref::<DTLSConn>()?;
+        dtls.connection_state()
+            .await
+            .peer_certificates
+            .first()
+            .map(|cert| crypto::generate_fingerprint(cert))
+    }
+
     pub(crate) async fn get_certificate_fingerprint(
         &self,
         addr: SocketAddr,
@@ -363,7 +500,10 @@ impl MousehopListener {
             .filter(|slot| slot.session == session)
             .map(|slot| slot.conn.clone());
         if let Some(conn) = conn {
-            let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
+            let conn: &DTLSConn = crate::transport::raw(&conn)
+                .as_any()
+                .downcast_ref()
+                .expect("dtls conn");
             let certs = conn.connection_state().await.peer_certificates;
             let cert = certs.first()?;
             let fingerprint = crypto::generate_fingerprint(cert);
@@ -434,22 +574,16 @@ fn is_listenable_addr(ip: IpAddr) -> bool {
 /// Returns both IPv4 and IPv6 addresses; `is_listenable_addr` drops
 /// the ones a remote peer cannot reach (loopback, link-local,
 /// unspecified, multicast).
-fn enumerate_listenable_addrs() -> Vec<IpAddr> {
-    let ifaces = match if_addrs::get_if_addrs() {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("get_if_addrs failed: {e}");
-            return Vec::new();
-        }
-    };
-    ifaces
+fn enumerate_listenable_addrs() -> std::io::Result<Vec<IpAddr>> {
+    let ifaces = if_addrs::get_if_addrs()?;
+    Ok(ifaces
         .into_iter()
         .map(|iface| match iface.addr {
             if_addrs::IfAddr::V4(v4) => IpAddr::V4(v4.ip),
             if_addrs::IfAddr::V6(v6) => IpAddr::V6(v6.ip),
         })
         .filter(|ip| is_listenable_addr(*ip))
-        .collect()
+        .collect())
 }
 
 async fn try_bind_listener(
@@ -474,6 +608,7 @@ fn spawn_accept_task(
     conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
     sessions: ListenerSessions,
     connection_attempts: Arc<Mutex<VecDeque<String>>>,
+    kcp_timeouts: crate::transport::Timeouts,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         loop {
@@ -483,26 +618,55 @@ fn spawn_accept_task(
                 _ = sleep => continue,
                 c = listener.accept() => match c {
                     Ok((conn, addr)) => {
+                        let Ok(permit) = sessions.admissions.permits.clone().try_acquire_owned() else {
+                            let _ = conn.close().await;
+                            continue;
+                        };
+                        let sessions = sessions.clone();
+                        let conns = conns.clone();
+                        let listen_tx = listen_tx.clone();
+                        spawn_local(async move {
+                        let _permit = permit;
+                        let dtls = conn.as_any().downcast_ref::<DTLSConn>().expect("dtls conn");
+                        let certs = dtls.connection_state().await.peer_certificates;
+                        let Some(cert) = certs.first() else { let _ = conn.close().await; return; };
+                        let fingerprint = crypto::generate_fingerprint(cert);
+                        let authorized = sessions.authorized.read().expect("lock").contains_key(&fingerprint);
+                        if !sessions.admissions.receive(conn.as_ref(), &fingerprint, authorized).await
+                            || !sessions.authorized.read().expect("lock").contains_key(&fingerprint)
+                        {
+                            let _ = conn.close().await;
+                            return;
+                        }
+                        drop(_permit);
                         log::info!("dtls client connected, ip: {addr}");
+                        let conn = if sessions.recovery_available.get() {
+                            crate::transport::attach_recoverable(conn, None, kcp_timeouts)
+                        } else { crate::transport::attach(conn, None, kcp_timeouts) };
                         let session = sessions.allocate(addr);
                         let replaced = {
                             let mut conns_guard = conns.lock().await;
+                            if let Some(old) = conns_guard.get(&addr) {
+                                crate::transport::invalidate_clipboard(&old.conn);
+                            }
                             conns_guard.insert(
                                 addr,
                                 AcceptedConnection {
                                     session,
+                                    fingerprint: fingerprint.clone(),
                                     conn: conn.clone(),
                                 },
                             )
                         };
                         if let Some(replaced) = replaced {
+                            crate::transport::invalidate_clipboard(&replaced.conn);
                             log::info!(
                                 "replacing prior DTLS session {} for reused peer address {addr}",
                                 replaced.session
                             );
                             let _ = replaced.conn.close().await;
                         }
-                        let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
+                        let dtls_conn: &DTLSConn = crate::transport::raw(&conn).as_any().downcast_ref().expect("dtls conn");
                         let certs = dtls_conn.connection_state().await.peer_certificates;
                         let cert = certs.first().expect("cert");
                         let fingerprint = crypto::generate_fingerprint(cert);
@@ -521,6 +685,7 @@ fn spawn_accept_task(
                             conn,
                             listen_tx.clone(),
                         ));
+                        });
                     }
                     Err(e) => {
                         if let Error::Std(ref se) = e {
@@ -567,6 +732,7 @@ fn spawn_supervisor_task(
     mut request_port_change_rx: Receiver<u16>,
     port_changed_tx: Sender<Result<u16, ListenerCreationError>>,
     mut wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    kcp_timeouts: crate::transport::Timeouts,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         let mut port = initial_port;
@@ -595,11 +761,31 @@ fn spawn_supervisor_task(
         // Skip the immediate-first tick — we just enumerated at startup
         // and don't want to thrash listeners on the first iteration.
         reconcile_tick.tick().await;
+        let mut refresh = BackgroundRefresh::new();
+        let mut interface_revision = 0u64;
         loop {
             tokio::select! {
                 _ = reconcile_tick.tick() => {
+                    let revision = interface_revision;
+                    refresh.request(move || (revision, enumerate_listenable_addrs()));
+                }
+                result = refresh.event() => {
+                    let addrs = match result {
+                        Ok((revision, _)) if revision != interface_revision => {
+                            // An Up/Down event superseded this slow snapshot.
+                            // Never remove a newly bound listener using old IPs.
+                            let revision = interface_revision;
+                            refresh.request(move || (revision, enumerate_listenable_addrs()));
+                            continue;
+                        }
+                        Ok((_, Ok(addrs))) => addrs,
+                        result => {
+                            log::warn!("listener enumeration failed; retaining listeners: {result:?}");
+                            continue;
+                        }
+                    };
                     let current_ips: HashSet<IpAddr> =
-                        enumerate_listenable_addrs().into_iter().collect();
+                        addrs.into_iter().collect();
                     let to_drop: Vec<IpAddr> = listeners
                         .keys()
                         .filter(|ip| !current_ips.contains(*ip))
@@ -610,6 +796,7 @@ fn spawn_supervisor_task(
                         // `listeners.keys()` and we run single-
                         // threaded, so the remove always returns Some.
                         listeners.remove(&ip);
+                        close_reliable_connections(&conns, Some(ip)).await;
                         log::info!(
                             "reconcile: dropping stale listener on {ip}:{port} \
                              (IP no longer present on any interface)"
@@ -633,6 +820,7 @@ fn spawn_supervisor_task(
                                         conns.clone(),
                                         sessions.clone(),
                                         connection_attempts.clone(),
+                                        kcp_timeouts,
                                     );
                                     slot.insert(ListenerSlot { accept_task: task });
                                     log::info!(
@@ -654,6 +842,7 @@ fn spawn_supervisor_task(
                     }
                 } => match ev {
                     Ok(if_watch::IfEvent::Up(net)) => {
+                        interface_revision = interface_revision.wrapping_add(1);
                         let ip = net.addr();
                         if is_listenable_addr(ip) && !listeners.contains_key(&ip) {
                             match try_bind_listener(ip, port, &cfg).await {
@@ -664,6 +853,7 @@ fn spawn_supervisor_task(
                                         conns.clone(),
                                         sessions.clone(),
                                         connection_attempts.clone(),
+                                        kcp_timeouts,
                                     );
                                     listeners.insert(ip, ListenerSlot { accept_task: task });
                                     log::info!("interface up: now listening on {ip}:{port}");
@@ -673,7 +863,9 @@ fn spawn_supervisor_task(
                         }
                     }
                     Ok(if_watch::IfEvent::Down(net)) => {
+                        interface_revision = interface_revision.wrapping_add(1);
                         let ip = net.addr();
+                        close_reliable_connections(&conns, Some(ip)).await;
                         if listeners.remove(&ip).is_some() {
                             log::info!("interface down: stopped listening on {ip}:{port}");
                         }
@@ -719,9 +911,26 @@ fn spawn_supervisor_task(
                 }
                 p = request_port_change_rx.recv() => {
                     let new_port = p.expect("channel closed");
+                    let revision = interface_revision;
+                    refresh.request(move || (revision, enumerate_listenable_addrs()));
+                    let mut result = refresh.event().await;
+                    if matches!(&result, Ok((revision, _)) if *revision != interface_revision) {
+                        let revision = interface_revision;
+                        refresh.request(move || (revision, enumerate_listenable_addrs()));
+                        result = refresh.event().await;
+                    }
+                    let addrs = match result {
+                        Ok((_, Ok(addrs))) => addrs,
+                        result => {
+                            log::warn!("port change: enumeration failed; retaining listeners: {result:?}");
+                            port_changed_tx.send(Err(ListenerCreationError::NoBoundListener))
+                                .expect("channel closed");
+                            continue;
+                        }
+                    };
+                    close_reliable_connections(&conns, None).await;
                     listeners.clear(); // Drop aborts each accept task
                     let mut bound = 0usize;
-                    let addrs = enumerate_listenable_addrs();
                     for ip in &addrs {
                         match try_bind_listener(*ip, new_port, &cfg).await {
                             Ok(l) => {
@@ -731,6 +940,7 @@ fn spawn_supervisor_task(
                                     conns.clone(),
                                     sessions.clone(),
                                     connection_attempts.clone(),
+                                    kcp_timeouts,
                                 );
                                 listeners.insert(*ip, ListenerSlot { accept_task: task });
                                 bound += 1;
@@ -754,7 +964,8 @@ fn spawn_supervisor_task(
     })
 }
 
-/// Max silence on an accepted DTLS session before it's torn down.
+/// Max silence on a Legacy DTLS session before it's torn down.
+/// Established KCP sessions use the transport's configured peer/input deadlines.
 /// DTLS rides UDP, which carries no FIN — a peer that goes silent
 /// (asleep, network-partitioned, daemon killed) leaves an otherwise-
 /// blocked `recv` waiting forever, and the slot in `conns` becomes
@@ -794,6 +1005,14 @@ async fn read_loop(
         let n = match tokio::time::timeout(RECV_IDLE_TIMEOUT, conn.recv(&mut b)).await {
             Ok(Ok(n)) => n,
             Ok(Err(_)) => break,
+            Err(_)
+                if matches!(
+                    crate::transport::status(&conn).as_str(),
+                    "KCP" | "Recovering"
+                ) =>
+            {
+                continue;
+            }
             Err(_) => {
                 log::warn!(
                     "{addr}: no datagram in {RECV_IDLE_TIMEOUT:?} — closing stale connection"
@@ -809,6 +1028,7 @@ async fn read_loop(
             log::debug!("ending replaced inbound DTLS read session {session} for {addr}");
             break;
         }
+        let receipt = crate::transport::receipt(&conn);
         let datagram = &b[..n];
         match decode_listen_datagram(datagram) {
             Some(event) if !handshake_allows_event(hello_ok.get(), &event) => {
@@ -829,6 +1049,7 @@ async fn read_loop(
                 hello_ok.set(true);
                 dtls_tx
                     .send(ListenEvent::Msg {
+                        receipt,
                         event: ProtoEvent::Hello {
                             magic,
                             commit,
@@ -842,6 +1063,7 @@ async fn read_loop(
             Some(event) => dtls_tx
                 .send(ListenEvent::Msg {
                     event,
+                    receipt,
                     addr,
                     session,
                 })
@@ -860,6 +1082,7 @@ async fn read_loop(
             }
         }
     }
+    let _ = conn.close().await;
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
     // A peer can reconnect with the same UDP 4-tuple before the old
@@ -888,16 +1111,37 @@ async fn accepted_connection_is_current(
         .is_some_and(|slot| slot.session == session)
 }
 
+async fn close_reliable_connections(
+    conns: &AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>,
+    local_ip: Option<IpAddr>,
+) {
+    let connections: Vec<_> = conns
+        .lock()
+        .await
+        .values()
+        .filter(|slot| !Arc::ptr_eq(crate::transport::raw(&slot.conn), &slot.conn))
+        .filter(|slot| local_ip.is_none_or(|ip| slot.conn.local_addr().is_ok_and(|a| a.ip() == ip)))
+        .map(|slot| slot.conn.clone())
+        .collect();
+    for conn in connections {
+        let _ = conn.close().await;
+    }
+}
+
 fn remove_connection_if_current(
     conns: &mut HashMap<SocketAddr, AcceptedConnection>,
     addr: SocketAddr,
     session: ListenerSession,
 ) -> Option<AcceptedConnection> {
-    conns
+    let slot = conns
         .get(&addr)
         .is_some_and(|current| current.session == session)
         .then(|| conns.remove(&addr))
-        .flatten()
+        .flatten();
+    if let Some(slot) = &slot {
+        crate::transport::invalidate_clipboard(&slot.conn);
+    }
+    slot
 }
 
 /// Connection-establishment deadline. A peer that has not presented
@@ -943,6 +1187,73 @@ mod tests {
     use super::*;
     use tokio::net::UdpSocket;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn udp_listener_survives_a_peer_closing_its_port() {
+        let listener = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.addr().await.unwrap();
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        first.send_to(b"first", addr).await.unwrap();
+        let (old, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(first);
+        // The reply reaches a closed port and Windows reports ICMP as 10054
+        // on the shared receive socket. A different peer must still connect.
+        old.send(b"reply after close").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let next = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        next.send_to(b"next", addr).await.unwrap();
+        let (accepted, peer) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("shared UDP listener died after peer closed")
+            .unwrap();
+        assert_eq!(peer, next.local_addr().unwrap());
+        let mut bytes = [0; 16];
+        let len = tokio::time::timeout(Duration::from_secs(1), accepted.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..len], b"next");
+        listener.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clipboard_removal_fences_owned_lane_without_touching_replacement() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:4242".parse().unwrap();
+                let conn = crate::transport::attach_recoverable(
+                    test_conn().await,
+                    Some(crate::transport::InputTransport::KcpRequired),
+                    crate::transport::Timeouts::default(),
+                );
+                let lane = crate::transport::clipboard_lane(&conn).unwrap();
+                let mut conns = HashMap::from([(
+                    addr,
+                    AcceptedConnection {
+                        session: 7,
+                        fingerprint: "observed-peer".into(),
+                        conn: conn.clone(),
+                    },
+                )]);
+                assert!(remove_connection_if_current(&mut conns, addr, 6).is_none());
+                assert_eq!(lane.try_receive(), Ok(None));
+                let removed = remove_connection_if_current(&mut conns, addr, 7).unwrap();
+                assert_eq!(removed.fingerprint, "observed-peer");
+                assert_eq!(
+                    lane.try_receive(),
+                    Err(crate::transport::ClipboardError::Closed)
+                );
+                assert!(crate::transport::clipboard_lane(&conn).is_none());
+                conn.close().await.unwrap();
+            })
+            .await;
+    }
+
     async fn test_conn() -> ArcConn {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"))
     }
@@ -957,6 +1268,7 @@ mod tests {
             addr,
             AcceptedConnection {
                 session: replacement_session,
+                fingerprint: "test-peer".into(),
                 conn: replacement.clone(),
             },
         )]);
@@ -977,6 +1289,7 @@ mod tests {
             addr,
             AcceptedConnection {
                 session,
+                fingerprint: "test-peer".into(),
                 conn: current.clone(),
             },
         )]);
@@ -997,6 +1310,35 @@ mod tests {
 
         assert!(!sessions.is_current(addr, old));
         assert!(sessions.is_current(addr, replacement));
+    }
+
+    #[test]
+    fn revocation_invalidates_queued_accept_and_input() {
+        let addr = "127.0.0.1:4242".parse().expect("test address");
+        let sessions = ListenerSessions::default();
+        let session = sessions.allocate(addr);
+        assert!(sessions.remove_if_current(addr, session));
+        assert!(!listen_event_is_current(
+            &sessions,
+            &ListenEvent::Accept {
+                addr,
+                session,
+                fingerprint: "revoked".into(),
+            }
+        ));
+        assert!(!listen_event_is_current(
+            &sessions,
+            &ListenEvent::Msg {
+                addr,
+                session,
+                event: ProtoEvent::Ping,
+                receipt: None,
+            }
+        ));
+        assert!(listen_event_is_current(
+            &sessions,
+            &ListenEvent::Disconnected { addr, session }
+        ));
     }
 
     #[test]

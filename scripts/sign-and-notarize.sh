@@ -7,7 +7,7 @@
 # and is torn down on exit (success or failure).
 #
 # Usage:
-#   sign-and-notarize.sh --app target/release/bundle/osx/Mousehop.app
+#   sign-and-notarize.sh --app target/release/bundle/osx/MotionDuo.app
 #       Code-sign the bundle and every nested dylib (Developer ID +
 #       hardened runtime). No notarization here — the .app is notarized
 #       as part of the DMG.
@@ -26,7 +26,7 @@
 #
 # Local development: leave MACOS_CERTIFICATE_P12_BASE64 unset and this
 # script no-ops with a notice — the ad-hoc signature from
-# copy-macos-dylib.sh stays in place so the build still launches after
+# package-macos.sh stays in place so the build still launches after
 # the right-click → Open dance.
 
 set -euo pipefail
@@ -141,10 +141,7 @@ echo "==> Signing identity: $IDENTITY"
 # Apple's online ticket lookup on first launch.
 if [[ "$KIND" == "app" ]]; then
     # Inside-out: nested executables/frameworks/dylibs first, then the
-    # outer wrapper. Mousehop's bundle carries the GTK / libadwaita
-    # dylibs under Contents/Frameworks (copied in by
-    # copy-macos-dylib.sh), so this loop signs each of them before the
-    # wrapper seals the bundle.
+    # outer wrapper, if an audited dependency is added in the future.
     if [[ -d "$TARGET/Contents/Frameworks" || -d "$TARGET/Contents/PlugIns" || -d "$TARGET/Contents/Helpers" ]]; then
         while IFS= read -r -d '' nested; do
             echo "==> Signing nested: $nested"
@@ -165,7 +162,11 @@ if [[ "$KIND" == "app" ]]; then
     codesign --force --options runtime --timestamp \
         --keychain "$KEYCHAIN_PATH" \
         --sign "$IDENTITY" \
-        "$TARGET/Contents/MacOS/mousehop"
+        "$TARGET/Contents/MacOS/motionduo"
+    codesign --force --options runtime --timestamp \
+        --keychain "$KEYCHAIN_PATH" \
+        --sign "$IDENTITY" \
+        "$TARGET/Contents/MacOS/motionduo-ui"
 
     echo "==> Signing app bundle"
     codesign --force --options runtime --timestamp \

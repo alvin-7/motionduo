@@ -646,6 +646,7 @@ where
                         .send((pos, CaptureEvent::Begin {
                             cursor,
                             normalized_cursor,
+                                                    source_size: barrier_configuration.layout.size(),
                         }))
                         .await
                         .expect("no channel");

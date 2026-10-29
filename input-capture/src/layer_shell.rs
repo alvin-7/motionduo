@@ -183,6 +183,7 @@ struct CrossingPreflight {
     pointer_serial: u32,
     cursor: (i32, i32),
     normalized_cursor: Option<(f32, f32)>,
+    source_size: Option<(u32, u32)>,
 }
 
 impl Window {
@@ -633,6 +634,7 @@ impl State {
         pointer_serial: u32,
         cursor: (i32, i32),
         normalized_cursor: Option<(f32, f32)>,
+        source_size: Option<(u32, u32)>,
     ) {
         let window = self.focused.as_ref().expect("focused edge");
         window
@@ -644,6 +646,7 @@ impl State {
             pointer_serial,
             cursor,
             normalized_cursor,
+            source_size,
         });
     }
 
@@ -1061,7 +1064,7 @@ impl Dispatch<WlPointer, ()> for State {
                 let layout = output_layout(&app.outputs);
                 let normalized_cursor = normalize_cursor_in_layout(&layout, cursor);
                 if app.crossing_modifiers.contains_key(&window.pos) {
-                    app.start_crossing_preflight(serial, cursor, normalized_cursor);
+                    app.start_crossing_preflight(serial, cursor, normalized_cursor, layout.size());
                 } else {
                     app.grab(&surface, pointer, serial, qh);
                     app.pending_events.push_back((
@@ -1069,6 +1072,7 @@ impl Dispatch<WlPointer, ()> for State {
                         CaptureEvent::Begin {
                             cursor: Some(cursor),
                             normalized_cursor,
+                            source_size: layout.size(),
                         },
                     ));
                 }
@@ -1250,6 +1254,7 @@ impl Dispatch<WlKeyboard, ()> for State {
                             CaptureEvent::Begin {
                                 cursor: Some(preflight.cursor),
                                 normalized_cursor: preflight.normalized_cursor,
+                                source_size: preflight.source_size,
                             },
                         ));
                         queue_modifier_snapshot(app, window.pos, &held_modifiers);

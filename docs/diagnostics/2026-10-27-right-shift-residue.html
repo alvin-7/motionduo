@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mousehop：右 Shift 残留根因与全修饰键修复</title>
+<style>
+:root{--ink:#173e33;--green:#26674e;--line:#b9c9b8;--amber:#8e641e}*{box-sizing:border-box}body{margin:0;background:linear-gradient(125deg,#e2ecdf,#faf6eb 65%,#e5ede5);color:var(--ink);font:17px/1.8 Georgia,"Microsoft YaHei",serif}main{max-width:1060px;margin:auto;padding:44px 26px 70px}header{border-top:6px solid var(--green)}h1{font-size:clamp(30px,5vw,48px);line-height:1.3}h2{font-size:25px;margin-top:34px}code,pre,.meta{font-family:Consolas,monospace}code{font-size:.85em;overflow-wrap:anywhere}pre{white-space:pre-wrap;background:#dfeadd;border-left:4px solid var(--green);padding:20px;font-size:15px;line-height:1.9}table{width:100%;border-collapse:collapse}th,td{padding:12px 9px;text-align:left;border-bottom:1px solid var(--line)}.note{padding:16px 20px;background:#f1e7d0;border-left:4px solid var(--amber)}li{margin:8px 0}footer{font-size:14px;border-top:1px solid var(--line);margin-top:30px;padding-top:18px}@media(max-width:680px){main{padding:28px 16px}td,th{font-size:14px;padding:9px 5px}pre{font-size:13px}}
+</style><main>
+<header><p class="meta">MOUSEHOP / INCIDENT + REPAIR / 2026-10-27</p><h1>右 Shift 已经松开，<br>释放确认却补回了左 Shift。</h1><p>两端安装版本 v0.17.19 / dfb532bc。诊断重启后原生状态清空，用户按左右 Shift 对照复现；此次已保存按下、释放、原生注入与系统状态的完整修饰键序列。</p></header>
+<h2>一、这次记录确定了什么？</h2>
+<table><thead><tr><th>阶段</th><th>证据</th><th>结论</th></tr></thead><tbody>
+<tr><td>Windows 捕获</td><td>evdev 54，state 1 → 0</td><td>右 Shift 松开已被捕获</td></tr>
+<tr><td>Mac 按下</td><td>right_shift，keycode 0x3c，flags 0x20004</td><td>传输与注入规划未把右侧映射成左侧</td></tr>
+<tr><td>按下后的原生读回</td><td>flags 0x20004，但 KeyState(56)=true、KeyState(60)=false</td><td>按键位图的左侧值不能直接当作真实左侧输入</td></tr>
+<tr><td>Mac 首次释放</td><td>right_shift，flags 0</td><td>释放已经到达并提交</td></tr>
+<tr><td>Mac 释放重试</td><td>right_shift，flags 0x20002，IOHID 与 CGEvent 均提交</td><td>程序自己在重试时重新发布了左 Shift 状态</td></tr>
+<tr><td>最终系统状态</td><td>HID / combined 均为 0x20020002，左 Shift 按住、右侧松开</td><td>系统级左 Shift 残留；旧逻辑却将远程右侧标记为释放完成</td></tr>
+</tbody></table>
+<p>Mac 端关键时间为 03:41:28.508Z（按下）、03:41:28.996Z（首次释放及重试）、03:41:29.006Z（最终残留）。这些均为同一台 Mac 的记录。不用两机时间戳差值推算网络延迟。左 Shift 对照在 03:41:22Z 正常释放，之后系统曾回到无修饰键状态。</p>
+<h2>二、根因：把按键位图误用成了左右侧证据</h2>
+<pre>系统侧别 flags：右 Shift
+按键位图 KeyState：左 Shift 为 true
+                ↓ 旧代码把二者直接 OR
+凭空补出“左 Shift”设备侧标志
+                ↓ 远程只拥有右 Shift
+多出的左侧被当成本地键盘输入保护
+                ↓ 释放重试
+发布左 Shift 标志 → 残留</pre>
+<p><code>MacKeySink::modifier_flags</code> 原先对每个 true 的 <code>CGEventSourceKeyState</code> 调用 <code>flags_for(side)</code>，同时添加一般修饰键位和设备侧别位。这次记录证明：对于注入的右 Shift，位图与侧别 flags 可以不一致。旧代码错误地“制造”了一个并不存在于 flags 的左侧键。</p>
+<p>该读回合并逻辑来自本分支 <code>39e0558</code> 的修饰键释放确认改动，不是 v0.17.19 的网络查询隔离改动；也不是这次 Windows 松键包丢失。</p>
+<h2>三、统一修复，不为右 Shift 写特例</h2>
+<ul>
+<li><strong>左右侧别只取原生 device flags。</strong>按键位图不能再创造左侧或右侧设备标志。</li>
+<li><strong>位图仍用于保守确认。</strong>若 flags 已清空但位图还报告有键按住，只补充 Shift / Control / Option / Command 的一般位，不提前宣布释放成功。</li>
+<li><strong>保留已有释放屏障。</strong>仍等待有界的异步读回与重试，不延长超时、不无条件清空所有修饰键。</li>
+<li><strong>保留真实本地键。</strong>Mac 原生 flags 明确表示的本地另一侧或其他修饰键继续保留。远程与本地同一侧同时按住的所有权歧义仍是原有平台限制。</li>
+</ul>
+<p>生产改动只在 <code>input-emulation/src/macos.rs::modifier_flags</code> 和 <code>input-emulation/src/macos_keyboard.rs::observed_modifier_flags</code>。没有新增系统查询或后台线程，没有改变协议、心跳、键码映射或鼠标路径。</p>
+<h2>四、其他按键检查范围</h2>
+<table><thead><tr><th>按键</th><th>处理</th><th>验证边界</th></tr></thead><tbody>
+<tr><td>左右 Shift</td><td>统一侧别读回修复</td><td>原版右侧实机复现；左侧对照正常；补丁两侧回归覆盖</td></tr>
+<tr><td>左右 Ctrl</td><td>同一修复，无专用清理特例</td><td>两侧回归覆盖；本轮未实机逐一复现别名故障</td></tr>
+<tr><td>左右 Alt / Option</td><td>同一修复</td><td>两侧回归覆盖，未宣称均实机触发</td></tr>
+<tr><td>左右 Win / Command</td><td>同一修复</td><td>两侧回归覆盖，未宣称均实机触发</td></tr>
+<tr><td>双侧同时按住 / 多修饰键组合</td><td>保留剩余侧，全部远程释放时无残留</td><td>新增八侧组合清理及 56 种远程／本地不同侧配对回归</td></tr>
+<tr><td>Caps Lock、普通字符、自动重复</td><td>不同注入路径，不加入侧别推断</td><td>现有敲击、释放失败重试、重复与清理回归继续通过</td></tr>
+</tbody></table>
+<h2>五、验证</h2>
+<p>新增 7 项回归，包括 65,536 种原生侧别／位图组合。复现模型在旧算法下明确失败：释放右 Shift 的 CGEvent 携带了 0x20002，而不是 0；修复后通过。</p>
+<table><thead><tr><th>工作区测试</th><th>通过</th><th>失败</th><th>忽略 / 过滤</th></tr></thead><tbody><tr><td>Windows</td><td>322</td><td>0</td><td>3 / 1</td></tr><tr><td>Mac Apple Silicon</td><td>362</td><td>0</td><td>2 / 1</td></tr></tbody></table>
+<p>过滤项为既有环境敏感测试 <code>latency::tests::unroutable_address_times_out_as_unreachable</code>，忽略项保持不变。没有将忽略或过滤项算作通过。</p>
+<p>两平台 <code>cargo clippy --workspace --all-targets --all-features --locked</code> 均通过，格式和 diff 检查通过。Windows 首轮缺少 GTK 构建环境，补齐本项目已有 GTK 环境后重跑通过；既有 Cargo 和 Mac 原生归档工具警告保留。</p>
+<p class="note"><strong>源码修复与自动化验证，不等于安装后的实机验收。</strong>当前运行中的两端仍是已发布 v0.17.19，未被替换。修复版本仍需原机按同一左右 Shift 操作验收；其他修饰键完成了共享逻辑检查和自动化覆盖，不宣称全部在实体键盘上复现或验收。</p>
+<footer>原始证据：<code>target/diagnostics/right-shift-20261027/windows-repro1.jsonl</code>、<code>macos-repro1.jsonl</code>、两端原生状态快照及修复前后测试日志。保留范围仅为修饰键和连接诊断；不记录普通输入内容。Mac 编译测试使用隔离目录，没有替换应用或更改权限。</footer>
+</main></html>

@@ -1,290 +1,106 @@
-name: "Release"
-run-name: "Release - ${{ github.event.release.tag_name || inputs.tag }}"
+name: Release
+run-name: Release - ${{ github.event.release.tag_name || inputs.tag }}
 
-# release-plz creates the GitHub Release; this workflow then builds the
-# platform binaries + Flatpak bundle and attaches them to it.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to (re)build binaries for'
+        description: Existing release tag to build
         required: true
+        type: string
 
-env:
-  CARGO_TERM_COLOR: always
-
-# Each build job attaches its own asset to the Release directly via
-# `gh release upload --clobber` (idempotent on re-run). This replaces a
-# trailing job that round-tripped every artifact through actions/
-# upload-artifact + download-artifact — a flaky platform now fails on
-# its own without blocking the others' uploads.
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
 jobs:
-  linux-release-build:
-    runs-on: ubuntu-22.04
+  build:
+    if: ${{ github.event_name != 'release' || github.event.release.prerelease == false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, arch: x86_64 }
+          - { os: ubuntu-22.04-arm, arch: aarch64 }
+          - { os: windows-latest, arch: x86_64 }
+          - { os: macos-15-intel, arch: intel }
+          - { os: macos-15, arch: arm64 }
+    runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
-    - name: install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install libx11-dev libxtst-dev
-        sudo apt-get install libadwaita-1-dev libgtk-4-dev libdbus-1-dev
-    - uses: Swatinem/rust-cache@v2
-    - name: Release Build
-      run: cargo build --release
-    - name: Stage tarball contents
-      # Bundles the binary with the desktop file, app icon, LICENSE,
-      # and NOTICE so the mousehop-bin AUR PKGBUILD (and other distro
-      # packagers) can install everything from one tarball.
-      run: |
-        TAG="${{ github.event.release.tag_name || inputs.tag }}"
-        ver="${TAG#v}"
-        stage="mousehop-${ver}-x86_64"
-        mkdir "$stage"
-        cp target/release/mousehop \
-           mousehop/com.mousehop.Mousehop.desktop \
-           mousehop-gtk/resources/com.mousehop.Mousehop.svg \
-           LICENSE NOTICE \
-           "$stage/"
-        tar -czf "${stage}.tar.gz" "$stage"
-    - name: Attach tarball to the release
-      env:
-        GH_TOKEN: ${{ github.token }}
-        TAG: ${{ github.event.release.tag_name || inputs.tag }}
-      run: gh release upload "$TAG" mousehop-*-x86_64.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
-
-  linux-arm64-release-build:
-    runs-on: ubuntu-22.04-arm
-    steps:
-    - uses: actions/checkout@v6
-    - name: install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install libx11-dev libxtst-dev
-        sudo apt-get install libadwaita-1-dev libgtk-4-dev libdbus-1-dev
-    - uses: Swatinem/rust-cache@v2
-    - name: Release Build
-      run: cargo build --release
-    - name: Stage tarball contents
-      run: |
-        TAG="${{ github.event.release.tag_name || inputs.tag }}"
-        ver="${TAG#v}"
-        stage="mousehop-${ver}-aarch64"
-        mkdir "$stage"
-        cp target/release/mousehop \
-           mousehop/com.mousehop.Mousehop.desktop \
-           mousehop-gtk/resources/com.mousehop.Mousehop.svg \
-           LICENSE NOTICE \
-           "$stage/"
-        tar -czf "${stage}.tar.gz" "$stage"
-    - name: Attach tarball to the release
-      env:
-        GH_TOKEN: ${{ github.token }}
-        TAG: ${{ github.event.release.tag_name || inputs.tag }}
-      run: gh release upload "$TAG" mousehop-*-aarch64.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
-
-  windows-release-build:
-    runs-on: windows-latest
-    steps:
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    # needed for cache restore
-    - name: create gtk dir
-      run: mkdir C:\gtk-build\gtk\x64\release
-    - uses: actions/cache@v4
-      id: cache
-      with:
-        path: c:/gtk-build/gtk/x64/release/**
-        key: gtk-windows-build
-        restore-keys: gtk-windows-build
-    - name: Update path
-      run: |
-        echo "PKG_CONFIG=C:\gtk-build\gtk\x64\release\bin\pkgconf.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        echo "C:\pkg-config-lite-0.28-1\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        echo "C:\gtk-build\gtk\x64\release\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        echo $env:GITHUB_PATH
-        echo $env:PATH
-    - name: Install dependencies
-      if: steps.cache.outputs.cache-hit != 'true'
-      run: |
-        # choco install msys2
-        # choco install visualstudio2022-workload-vctools
-        # choco install pkgconfiglite
-        py -m venv .venv
-        .venv\Scripts\activate.ps1
-        # Keep this pin aligned with ci.yml. It includes the upstream fix that
-        # puts cargo-cbuild on librsvg's Meson PATH.
-        # https://github.com/wingtk/gvsbuild/pull/1803
-        py -m pip install git+https://github.com/wingtk/gvsbuild.git@6e67071890322a58d4d14ccd9fc4a61cc8494006
-        # see https://github.com/wingtk/gvsbuild/pull/1004
-        Move-Item "C:\Program Files\Git\usr\bin" "C:\Program Files\Git\usr\notbin"
-        Move-Item "C:\Program Files\Git\bin" "C:\Program Files\Git\notbin"
-        # windows-latest is now the VS2026 image; gvsbuild defaults to vs2022
-        # and can't find it, so target VS2026 explicitly (see ci.yml).
-        gvsbuild build --vs-ver vs2026 --msys-dir=C:\msys64 gtk4 libadwaita librsvg
-        Move-Item "C:\Program Files\Git\usr\notbin" "C:\Program Files\Git\usr\bin"
-        Move-Item "C:\Program Files\Git\notbin" "C:\Program Files\Git\bin"
-    - uses: actions/checkout@v6
-    - uses: Swatinem/rust-cache@v2
-    - name: Release Build
-      run: cargo build --release
-    - name: Create Archive
-      run: |
-        mkdir "mousehop-windows"
-        Get-Childitem -Path "C:\\gtk-build\\gtk\\x64\\release\\bin\\*.dll" -File -Recurse | Copy-Item -Destination "mousehop-windows"
-        Copy-Item -Path "target\release\mousehop.exe" -Destination "mousehop-windows"
-        Compress-Archive -Path "mousehop-windows\*" -DestinationPath mousehop-windows-x86_64.zip
-    - name: Attach archive to the release
-      env:
-        GH_TOKEN: ${{ github.token }}
-        TAG: ${{ github.event.release.tag_name || inputs.tag }}
-      run: gh release upload "$env:TAG" mousehop-windows-x86_64.zip --clobber --repo "$env:GITHUB_REPOSITORY"
-
-  macos-release-build:
-    runs-on: macos-15-intel
-    steps:
-    - uses: actions/checkout@v6
-    - name: Cache Homebrew downloads
-      uses: actions/cache@v4
-      with:
-        path: ~/Library/Caches/Homebrew/downloads
-        key: brew-${{ runner.arch }}-${{ hashFiles('.github/workflows/release.yml') }}
-        restore-keys: brew-${{ runner.arch }}-
-    - name: install dependencies
-      run: |
-        brew install gtk4 libadwaita imagemagick librsvg create-dmg
-    - name: Scope rust-cache to the runner image
-      # See ci.yml: keys the cache to the runner image so a Homebrew
-      # glib/gtk4 bump can't leave stale `-L .../Cellar/glib/<ver>`
-      # paths in cached build-script output.
-      shell: bash
-      run: echo "CACHE_IMAGE=${ImageOS:-}-${ImageVersion:-}" >> "$GITHUB_ENV"
-    - uses: Swatinem/rust-cache@v2
-      with:
-        key: ${{ env.CACHE_IMAGE }}
-    - name: Release Build
-      run: |
-        cargo build --release
-        cp target/release/mousehop mousehop-macos-intel
-    - name: Make icns
-      run: scripts/makeicns.sh
-    - name: Install cargo bundle
-      run: cargo install cargo-bundle
-    - name: Bundle
-      # Must run from mousehop/ so cargo-bundle's icon / resources /
-      # osx_info_plist_exts globs resolve against the manifest dir.
-      # The globs are evaluated from CWD (not the manifest), so running
-      # from the workspace root silently drops the icon, the menu-bar
-      # template PNG, and the LSUIElement / TCC usage-description plist.
-      run: |
-        (cd mousehop && cargo bundle --release)
-        scripts/copy-macos-dylib.sh "target/release/bundle/osx/Mousehop.app/Contents/MacOS/mousehop"
-    - name: Sign, notarize & package DMG
-      env:
-        # sign-and-notarize.sh consumes these; it no-ops to ad-hoc
-        # signing when MACOS_CERTIFICATE_P12_BASE64 is unset, so the
-        # build still succeeds without the secrets configured.
-        MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-        MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-        MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-        MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-        MOUSEHOP_SIGNING_PASSWORD: ${{ secrets.MOUSEHOP_SIGNING_PASSWORD }}
-      run: |
-        app="target/release/bundle/osx/Mousehop.app"
-        dmg="target/release/bundle/osx/mousehop-macos-intel.dmg"
-        scripts/sign-and-notarize.sh --app "$app"
-        create-dmg \
-          --volname "Mousehop" \
-          --window-pos 200 120 \
-          --window-size 600 400 \
-          --icon-size 96 \
-          --icon "Mousehop.app" 150 200 \
-          --app-drop-link 450 200 \
-          --no-internet-enable \
-          "$dmg" "$app"
-        scripts/sign-and-notarize.sh --dmg "$dmg"
-    - name: Attach DMG to the release
-      env:
-        GH_TOKEN: ${{ github.token }}
-        TAG: ${{ github.event.release.tag_name || inputs.tag }}
-      run: gh release upload "$TAG" target/release/bundle/osx/mousehop-macos-intel.dmg --clobber --repo "$GITHUB_REPOSITORY"
-
-  macos-arm64-release-build:
-    runs-on: macos-15
-    steps:
-    - uses: actions/checkout@v6
-    - name: Cache Homebrew downloads
-      uses: actions/cache@v4
-      with:
-        path: ~/Library/Caches/Homebrew/downloads
-        key: brew-${{ runner.arch }}-${{ hashFiles('.github/workflows/release.yml') }}
-        restore-keys: brew-${{ runner.arch }}-
-    - name: install dependencies
-      run: |
-        brew install gtk4 libadwaita imagemagick librsvg create-dmg
-    - name: Scope rust-cache to the runner image
-      # See ci.yml: keys the cache to the runner image so a Homebrew
-      # glib/gtk4 bump can't leave stale `-L .../Cellar/glib/<ver>`
-      # paths in cached build-script output.
-      shell: bash
-      run: echo "CACHE_IMAGE=${ImageOS:-}-${ImageVersion:-}" >> "$GITHUB_ENV"
-    - uses: Swatinem/rust-cache@v2
-      with:
-        key: ${{ env.CACHE_IMAGE }}
-    - name: Release Build
-      run: |
-        cargo build --release
-        cp target/release/mousehop mousehop-macos-arm64
-    - name: Make icns
-      run: scripts/makeicns.sh
-    - name: Install cargo bundle
-      run: cargo install cargo-bundle
-    - name: Bundle
-      # Must run from mousehop/ so cargo-bundle's icon / resources /
-      # osx_info_plist_exts globs resolve against the manifest dir.
-      # The globs are evaluated from CWD (not the manifest), so running
-      # from the workspace root silently drops the icon, the menu-bar
-      # template PNG, and the LSUIElement / TCC usage-description plist.
-      run: |
-        (cd mousehop && cargo bundle --release)
-        scripts/copy-macos-dylib.sh "target/release/bundle/osx/Mousehop.app/Contents/MacOS/mousehop"
-    - name: Sign, notarize & package DMG
-      env:
-        # sign-and-notarize.sh consumes these; it no-ops to ad-hoc
-        # signing when MACOS_CERTIFICATE_P12_BASE64 is unset, so the
-        # build still succeeds without the secrets configured.
-        MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-        MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-        MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-        MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-        MOUSEHOP_SIGNING_PASSWORD: ${{ secrets.MOUSEHOP_SIGNING_PASSWORD }}
-      run: |
-        app="target/release/bundle/osx/Mousehop.app"
-        dmg="target/release/bundle/osx/mousehop-macos-arm64.dmg"
-        scripts/sign-and-notarize.sh --app "$app"
-        create-dmg \
-          --volname "Mousehop" \
-          --window-pos 200 120 \
-          --window-size 600 400 \
-          --icon-size 96 \
-          --icon "Mousehop.app" 150 200 \
-          --app-drop-link 450 200 \
-          --no-internet-enable \
-          "$dmg" "$app"
-        scripts/sign-and-notarize.sh --dmg "$dmg"
-    - name: Attach DMG to the release
-      env:
-        GH_TOKEN: ${{ github.token }}
-        TAG: ${{ github.event.release.tag_name || inputs.tag }}
-      run: gh release upload "$TAG" target/release/bundle/osx/mousehop-macos-arm64.dmg --clobber --repo "$GITHUB_REPOSITORY"
-
-  # Flatpak bundle build + upload now lives in release-flatpak.yml,
-  # gated on the same `release: published` trigger. The split lets a
-  # Flatpak failure run independently of the macOS signing chain,
-  # and exposes a workflow_dispatch `ref` input so a manifest
-  # change can be validated against HEAD without cutting a release.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: mousehop-mygo/go.mod
+          cache-dependency-path: mousehop-mygo/go.sum
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libdbus-1-dev libgtk-3-dev
+      - name: Linux archive
+        if: runner.os == 'Linux'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          sh scripts/build-mygo.sh --release
+          stage="mousehop-${TAG#v}-$ARCH"
+          mkdir "$stage"
+          cp target/release/motionduo target/release/motionduo-ui \
+            mousehop/com.mousehop.Mousehop.desktop mousehop/assets/com.mousehop.Mousehop.svg \
+            LICENSE NOTICE mousehop-mygo/THIRD_PARTY_NOTICES.md "$stage/"
+          tar -czf "$stage.tar.gz" "$stage"
+      - name: Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          ./scripts/build-mygo.ps1 -Release
+          New-Item -ItemType Directory -Path mousehop-windows | Out-Null
+          Copy-Item target/release/motionduo.exe,target/release/motionduo-ui.exe,LICENSE,NOTICE,mousehop-mygo/THIRD_PARTY_NOTICES.md mousehop-windows
+          Compress-Archive mousehop-windows/* mousehop-windows-x86_64.zip
+      - name: macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install imagemagick librsvg create-dmg
+      - name: macOS bundle and DMG
+        if: runner.os == 'macOS'
+        env:
+          ARCH: ${{ matrix.arch }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          MOUSEHOP_SIGNING_PASSWORD: ${{ secrets.MOUSEHOP_SIGNING_PASSWORD }}
+        run: |
+          sh scripts/package-macos.sh
+          app="target/release/bundle/osx/MotionDuo.app"
+          dmg="mousehop-macos-$ARCH.dmg"
+          bash scripts/sign-and-notarize.sh --app "$app"
+          create-dmg --volname Mousehop --window-pos 200 120 --window-size 600 400 \
+            --icon-size 96 --icon MotionDuo.app 150 200 --app-drop-link 450 200 \
+            --no-internet-enable "$dmg" "$app"
+          bash scripts/sign-and-notarize.sh --dmg "$dmg"
+      - name: Upload Unix package
+        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(mousehop-*.tar.gz mousehop-*.dmg)
+          test ${#files[@]} -gt 0
+          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Upload Windows package
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$env:TAG" mousehop-windows-x86_64.zip --clobber --repo "$env:GITHUB_REPOSITORY"

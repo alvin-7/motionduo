@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev libdbus-1-dev
+            libx11-dev libxtst-dev libdbus-1-dev
       - uses: release-plz/action@v0.5
         with:
           command: release
@@ -55,7 +55,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev libdbus-1-dev
+            libx11-dev libxtst-dev libdbus-1-dev
       - uses: release-plz/action@v0.5
         with:
           command: release-pr

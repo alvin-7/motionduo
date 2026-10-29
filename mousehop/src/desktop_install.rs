@@ -20,7 +20,7 @@ use std::path::PathBuf;
 /// App icon and desktop entry, embedded into the binary so the install
 /// works from a `cargo install`ed binary with no repo checkout present.
 /// `assets/com.mousehop.Mousehop.svg` mirrors
-/// `mousehop-gtk/resources/com.mousehop.Mousehop.svg` (the icon used
+/// `mousehop/assets/com.mousehop.Mousehop.svg` (the icon used
 /// at runtime by the GTK frontend); keep both in sync if the icon
 /// changes.
 const ICON_SVG: &[u8] = include_bytes!("../assets/com.mousehop.Mousehop.svg");
@@ -33,7 +33,7 @@ const APP_ID: &str = "com.mousehop.Mousehop";
 /// Binary name written into the desktop entry's `Exec=` line. Rewritten
 /// to the running executable's absolute path so a launcher's PATH-less
 /// environment can still find it.
-const BINARY_NAME: &str = "mousehop";
+const BINARY_NAME: &str = "motionduo";
 
 /// `$XDG_DATA_HOME`, falling back to `$HOME/.local/share`.
 fn xdg_data_home() -> io::Result<PathBuf> {

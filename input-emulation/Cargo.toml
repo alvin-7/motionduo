@@ -54,6 +54,9 @@ core-foundation = "0.10.0"
 core-foundation-sys = "0.8.6"
 core-graphics = { version = "0.25.0", features = ["highsierra"] }
 keycode = "1.0.0"
+objc2 = { version = "0.6.4", optional = true }
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSData", "NSString"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.2", features = [
@@ -66,8 +69,16 @@ windows = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[build-dependencies]
+# Compiles `src/nx_key_bridge.c`, the only place that builds an SDK
+# `NXEventData` for `IOHIDPostEvent`. `build.rs` only invokes the compiler for
+# macOS targets, but the dependency itself has to be present on every host
+# because Cargo builds the script before it knows the target.
+cc = "1.2.59"
+
 [features]
 default = ["wlroots", "x11", "remote_desktop_portal", "libei"]
+clipboard-image = ["input-event/clipboard-png", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 wlroots = [
     "dep:wayland-client",
     "dep:wayland-protocols",

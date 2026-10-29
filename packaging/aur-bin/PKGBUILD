@@ -14,7 +14,7 @@ pkgdesc='Software KVM Switch / mouse & keyboard sharing software for Local Area 
 arch=('x86_64' 'aarch64')
 url='https://github.com/jondkinney/mousehop'
 license=('GPL-3.0-or-later')
-depends=('libadwaita' 'gtk4' 'libx11' 'libxtst' 'glib2' 'glibc' 'gcc-libs' 'hicolor-icon-theme')
+depends=('gtk3' 'libx11' 'libxtst' 'glib2' 'glibc' 'gcc-libs' 'hicolor-icon-theme')
 provides=("$_pkgname=$pkgver")
 conflicts=("$_pkgname" "$_pkgname-git")
 source_x86_64=("$_pkgname-$pkgver-x86_64.tar.gz::https://github.com/jondkinney/$_pkgname/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64.tar.gz")
@@ -28,11 +28,13 @@ package() {
   # $CARCH to the host arch so we pick the matching one without a case
   # statement.
   cd "$srcdir/$_pkgname-$pkgver-$CARCH"
-  install -Dm755 mousehop "$pkgdir/usr/bin/mousehop"
+  install -Dm755 motionduo-ui "$pkgdir/usr/bin/motionduo-ui"
+  install -Dm755 motionduo "$pkgdir/usr/bin/motionduo"
   install -Dm644 com.mousehop.Mousehop.desktop \
     "$pkgdir/usr/share/applications/com.mousehop.Mousehop.desktop"
   install -Dm644 com.mousehop.Mousehop.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.mousehop.Mousehop.svg"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD_PARTY_NOTICES.md "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
   install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
 }

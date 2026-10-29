@@ -1,14 +1,10 @@
 name: CI
 
-# Per-PR safety net: fmt + clippy + test on every OS we ship to.
-# Release-time builds live in release.yml; this is the pre-merge gate
-# that keeps main green.
-
 on:
   push:
-    branches: [main]
+    branches: [main, mygo]
   pull_request:
-    branches: [main]
+    branches: [main, mygo]
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,92 +14,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --check
-
   check:
-    name: clippy + test (${{ matrix.os }})
+    name: Rust + MyGo (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - macos-15-intel
-          - windows-latest
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-
-      - name: Scope rust-cache to the runner image
-        # ImageVersion changes whenever GitHub refreshes the runner
-        # image — which is also when preinstalled / Homebrew libs
-        # (notably glib + gtk4) move. Folding it into the cache key
-        # stops a cached build script's baked-in `-L /opt/homebrew/
-        # Cellar/glib/<ver>/lib` from outliving the Cellar dir it
-        # points at (`ld: library 'gio-2.0' not found`).
-        shell: bash
-        run: echo "CACHE_IMAGE=${ImageOS:-}-${ImageVersion:-}" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt, clippy
+      - uses: actions/setup-go@v6
         with:
-          key: ${{ env.CACHE_IMAGE }}
-
-      - name: Install Linux deps
+          go-version-file: mousehop-mygo/go.mod
+          cache-dependency-path: mousehop-mygo/go.sum
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev libdbus-1-dev
-
-      - name: Install macOS deps
-        if: runner.os == 'macOS'
-        run: brew install gtk4 libadwaita imagemagick
-
-      # Windows GTK stack lives in C:\gtk-build, populated by gvsbuild
-      # and cached so we only pay the build cost on cold cache.
-      - name: Windows - create gtk dir
+          sudo apt-get install -y libx11-dev libxtst-dev libdbus-1-dev libgtk-3-dev fonts-dejavu-core
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - name: 16 MiB in-memory clipboard release performance
+        if: runner.os == 'Windows' || runner.os == 'macOS'
+        run: cargo test --release -p mousehop --lib --all-features --locked clipboard_focus::tests::fake_sixteen_mib_release_performance -- --exact --nocapture
+      - run: go -C mousehop-mygo test ./...
+      - run: go -C mousehop-mygo vet ./...
+      - name: Go formatting
+        shell: bash
+        run: test -z "$(gofmt -l mousehop-mygo)"
+      - name: Windows paired build
         if: runner.os == 'Windows'
-        run: mkdir C:\gtk-build\gtk\x64\release
-      - name: Windows - cache gtk
-        if: runner.os == 'Windows'
-        uses: actions/cache@v4
-        id: cache
-        with:
-          path: c:/gtk-build/gtk/x64/release/**
-          key: gtk-windows-build
-          restore-keys: gtk-windows-build
-      - name: Windows - update PATH
+        shell: pwsh
+        run: ./scripts/build-mygo.ps1
+      - name: Windows application icon resources
         if: runner.os == 'Windows'
         run: |
-          echo "PKG_CONFIG=C:\gtk-build\gtk\x64\release\bin\pkgconf.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "C:\pkg-config-lite-0.28-1\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "C:\gtk-build\gtk\x64\release\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Windows - build gtk on cache miss
-        if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          py -m venv .venv
-          .venv\Scripts\activate.ps1
-          # gvsbuild 2026.8.0 installs cargo-c outside the PATH used by
-          # librsvg's Meson build. Pin the merged upstream fix until it is
-          # included in a release: https://github.com/wingtk/gvsbuild/pull/1803
-          py -m pip install git+https://github.com/wingtk/gvsbuild.git@6e67071890322a58d4d14ccd9fc4a61cc8494006
-          # windows-latest is now the VS2026 image; gvsbuild defaults to
-          # vs2022 and can't find it ("Unable to find applicable Visual
-          # Studio"), so target VS2026 explicitly. GTK4 pulls in librsvg,
-          # whose build exercises the pinned cargo-c fix above.
-          gvsbuild build --vs-ver vs2026 --msys-dir=C:\msys64 gtk4 libadwaita
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: cargo test
-        run: cargo test --workspace --all-features
+          python scripts/verify-mygo-icons.py
+          python scripts/verify-mygo-icons.py --binary target/debug/motionduo.exe
+      - name: Unix paired build
+        if: runner.os != 'Windows'
+        run: sh scripts/build-mygo.sh

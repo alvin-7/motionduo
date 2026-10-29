@@ -72,6 +72,7 @@ pub enum CaptureEvent {
     Begin {
         cursor: Option<(i32, i32)>,
         normalized_cursor: Option<(f32, f32)>,
+        source_size: Option<(u32, u32)>,
     },
     /// input event coming from capture handle
     Input(Event),
@@ -221,6 +222,7 @@ pub struct InputCapture {
     /// produced Begin. This remains authoritative if the host display layout
     /// changes before receiver metadata arrives.
     pending_begin_normalized_cursor: Option<(f32, f32)>,
+    entry_alignment: mousehop_ipc::ScreenAlignment,
     /// Motion deltas that arrived while `virtual_cursor` was still
     /// `None` (between `Begin` and the late-arriving
     /// `set_peer_bounds`). Drained into the freshly-seeded
@@ -395,6 +397,45 @@ fn model_topology_motion(
 }
 
 impl InputCapture {
+    /// Freeze only the remote position model; continue pumping the backend so
+    /// physical releases are observable. This does not release or warp locally.
+    pub fn freeze_remote_model(&mut self) {
+        self.reset_wall_press_state();
+    }
+
+    /// Rebase to the receiver's actual global cursor, including negative
+    /// monitor origins. No OS cursor is injected or warped by this operation.
+    pub fn restore_remote_model(
+        &mut self,
+        pos: Position,
+        cursor: (f64, f64),
+        fingerprint: u64,
+    ) -> bool {
+        let Some(layout) = self.peer_layout(pos) else {
+            return false;
+        };
+        if layout.recovery_fingerprint() != fingerprint
+            || !cursor.0.is_finite()
+            || !cursor.1.is_finite()
+        {
+            return false;
+        }
+        let Some(origin) = layout.origin() else {
+            return false;
+        };
+        let relative = (
+            cursor.0 - f64::from(origin.0),
+            cursor.1 - f64::from(origin.1),
+        );
+        let Some(model) = model_topology_motion(layout, pos, relative, 0.0, 0.0) else {
+            return false;
+        };
+        self.reset_wall_press_state();
+        self.capture_pos = Some(pos);
+        self.virtual_cursor = Some(model.cursor);
+        self.virtual_pos = model.entry_distance;
+        true
+    }
     /// create a new client with the given id
     pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
         assert!(!self.id_map.contains_key(&id));
@@ -502,7 +543,18 @@ impl InputCapture {
     /// 0 disables. Effective immediately for the next motion event;
     /// no need to recreate the backend.
     pub fn set_release_threshold(&mut self, threshold: u32) {
+        if self.release_threshold_px != threshold {
+            // A live change starts a fresh gesture, not a return armed using
+            // the previous threshold (including a newly increased one).
+            self.wall_press_pending = false;
+            self.wall_pressure = 0.0;
+        }
         self.release_threshold_px = threshold;
+        if threshold == 0 {
+            // Disabling must also cancel a previously armed fallback timer.
+            self.wall_press_pending = false;
+            self.wall_pressure = 0.0;
+        }
     }
 
     /// Cache the peer's display geometry for a position. Used by
@@ -569,6 +621,20 @@ impl InputCapture {
                 );
             }
         }
+    }
+
+    /// Keep sender-side tracking and the return warp on the same landing
+    /// transform sent in HandoverEnter / CursorPos.
+    pub fn set_entry_alignment(
+        &mut self,
+        pos: Position,
+        alignment: mousehop_ipc::ScreenAlignment,
+        normalized: (f32, f32),
+    ) {
+        self.entry_alignment = alignment;
+        self.pending_begin_normalized_cursor = Some(normalized);
+        self.virtual_cursor =
+            self.initial_virtual_cursor(pos, self.pending_begin_cursor, Some(normalized));
     }
 
     /// Cache the peer's complete logical display topology. The topology is a
@@ -805,6 +871,7 @@ impl InputCapture {
         self.virtual_cursor = None;
         self.pending_begin_cursor = None;
         self.pending_begin_normalized_cursor = None;
+        self.entry_alignment = mousehop_ipc::ScreenAlignment::Proportional;
         self.pending_motion = (0.0, 0.0);
         self.motion_since_begin = (0.0, 0.0);
         // Cancel any deferred AutoRelease — release() / handover have
@@ -871,8 +938,21 @@ impl InputCapture {
             return None;
         }
         let (origin_x, origin_y) = bounds.origin();
-        let nx = (gx / peer_w as f64).clamp(0.0, 1.0);
-        let ny = (gy / peer_h as f64).clamp(0.0, 1.0);
+        let nx = (gx / peer_w as f64).clamp(0.0, 1.0) as f32;
+        let ny = (gy / peer_h as f64).clamp(0.0, 1.0) as f32;
+        let ipc_pos = match pos {
+            Position::Left => mousehop_ipc::Position::Left,
+            Position::Right => mousehop_ipc::Position::Right,
+            Position::Top => mousehop_ipc::Position::Top,
+            Position::Bottom => mousehop_ipc::Position::Bottom,
+        };
+        let (nx, ny) = self.entry_alignment.map_cursor(
+            ipc_pos,
+            (nx, ny),
+            (peer_w, peer_h),
+            (host_w, host_h),
+        )?;
+        let (nx, ny) = (f64::from(nx), f64::from(ny));
         let host_w_i = host_w as i32;
         let host_h_i = host_h as i32;
         // Add the union origin back so the result is in pointer-event
@@ -910,7 +990,9 @@ impl InputCapture {
             CaptureEvent::Begin {
                 cursor,
                 normalized_cursor,
+                ..
             } => {
+                self.entry_alignment = mousehop_ipc::ScreenAlignment::Proportional;
                 // Receiver geometry and sensitivity belong to the previous
                 // connection epoch. Current peers republish all three before
                 // Ack; old peers publish Bounds only and must get the 1.0,
@@ -1103,6 +1185,7 @@ impl InputCapture {
             virtual_cursor: None,
             pending_begin_cursor: None,
             pending_begin_normalized_cursor: None,
+            entry_alignment: Default::default(),
             pending_motion: (0.0, 0.0),
             motion_since_begin: (0.0, 0.0),
             peer_bounds: HashMap::new(),
@@ -1403,6 +1486,146 @@ async fn create(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn r13_recovery_rebases_negative_origin_without_accumulating_pause_motion() {
+        use super::*;
+        let mut capture = InputCapture::new(Some(Backend::Dummy)).await.unwrap();
+        let layout = DisplayLayout::new([(-1920, -200, 3840, 1280)]);
+        capture.set_peer_layout(Position::Right, 1, 1, layout.clone());
+        capture.freeze_remote_model();
+        capture.track_wall_press(
+            Position::Right,
+            &CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 800.0,
+                dy: -400.0,
+            })),
+        );
+        assert_eq!(capture.pending_motion, (0.0, 0.0));
+        assert!(capture.restore_remote_model(
+            Position::Right,
+            (-1000.0, 100.0),
+            layout.recovery_fingerprint()
+        ));
+        assert_eq!(capture.virtual_cursor, Some((920.0, 300.0)));
+        assert_eq!(capture.wall_pressure, 0.0);
+        assert!(!capture.restore_remote_model(
+            Position::Right,
+            (0.0, 0.0),
+            layout.recovery_fingerprint() ^ 1
+        ));
+    }
+    #[tokio::test]
+    async fn disabling_wall_fallback_cancels_an_already_armed_return() {
+        let mut capture = super::InputCapture::new(Some(super::Backend::Dummy))
+            .await
+            .unwrap();
+        capture.set_release_threshold(1);
+        capture.track_wall_press(
+            super::Position::Right,
+            &super::CaptureEvent::Begin {
+                cursor: None,
+                normalized_cursor: None,
+                source_size: None,
+            },
+        );
+        let motion = super::CaptureEvent::Input(input_event::Event::Pointer(
+            input_event::PointerEvent::Motion {
+                time: 0,
+                dx: -10.0,
+                dy: 0.0,
+            },
+        ));
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(capture.wall_press_pending);
+        capture.set_release_threshold(0);
+        assert!(!capture.wall_press_pending);
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(!capture.wall_press_pending);
+        capture.set_release_threshold(1);
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(
+            capture.wall_press_pending,
+            "legacy fallback can be restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn wall_fallback_fires_after_grace_without_further_motion() {
+        use futures::StreamExt;
+        let mut capture = InputCapture::new(Some(Backend::Dummy)).await.unwrap();
+        capture.create(7, Position::Right).await.unwrap();
+        capture.wall_press_deadline = std::time::Duration::from_millis(25);
+        capture.set_release_threshold(100);
+        capture.track_wall_press(
+            Position::Right,
+            &CaptureEvent::Begin {
+                cursor: None,
+                normalized_cursor: None,
+                source_size: None,
+            },
+        );
+        let motion = |dx| {
+            CaptureEvent::Input(input_event::Event::Pointer(
+                input_event::PointerEvent::Motion {
+                    time: 0,
+                    dx,
+                    dy: 0.0,
+                },
+            ))
+        };
+        capture.track_wall_press(Position::Right, &motion(-99.0));
+        assert!(!capture.wall_press_pending);
+        capture.track_wall_press(Position::Right, &motion(-1.0));
+        assert!(capture.wall_press_pending);
+        assert!(!capture.wall_press_timer.is_elapsed());
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert!(matches!(
+            capture.next().await,
+            Some(Ok((7, CaptureEvent::AutoRelease)))
+        ));
+        assert!(!capture.wall_press_pending);
+    }
+
+    #[tokio::test]
+    async fn wall_fallback_yields_to_receiver_return_and_live_threshold_changes() {
+        let mut capture = InputCapture::new(Some(Backend::Dummy)).await.unwrap();
+        capture.set_release_threshold(100);
+        let begin = CaptureEvent::Begin {
+            cursor: None,
+            normalized_cursor: None,
+            source_size: None,
+        };
+        let motion = |dx| {
+            CaptureEvent::Input(input_event::Event::Pointer(
+                input_event::PointerEvent::Motion {
+                    time: 0,
+                    dx,
+                    dy: 0.0,
+                },
+            ))
+        };
+        capture.track_wall_press(Position::Right, &begin);
+        capture.track_wall_press(Position::Right, &motion(-100.0));
+        assert!(capture.wall_press_pending);
+        capture.set_release_threshold(200);
+        assert!(!capture.wall_press_pending);
+        assert_eq!(capture.wall_pressure, 0.0);
+        capture.track_wall_press(Position::Right, &motion(-199.0));
+        assert!(!capture.wall_press_pending);
+        capture.track_wall_press(Position::Right, &motion(-1.0));
+        assert!(capture.wall_press_pending);
+        capture.track_wall_press(Position::Right, &motion(1.0));
+        assert!(!capture.wall_press_pending, "moving away cancels fallback");
+        capture.track_wall_press(Position::Right, &motion(-201.0));
+        assert!(capture.wall_press_pending);
+        capture.release_no_host_warp().await.unwrap();
+        assert!(
+            !capture.wall_press_pending,
+            "receiver Leave wins before the grace deadline"
+        );
+    }
+
     use super::{
         Backend, CaptureEvent, InputCapture, Position, model_topology_motion,
         normalize_cursor_in_layout, scale_motion, wrapping_generation_is_newer,
@@ -1448,6 +1671,7 @@ mod tests {
             &CaptureEvent::Begin {
                 cursor: Some((-1000, 500)),
                 normalized_cursor: Some(normalized),
+                source_size: None,
             },
         );
 
@@ -1585,6 +1809,7 @@ mod tests {
             &CaptureEvent::Begin {
                 cursor: Some((100, 100)),
                 normalized_cursor: None,
+                source_size: None,
             },
         );
         capture.set_peer_bounds(Position::Right, 2000, 1000);
@@ -1607,6 +1832,7 @@ mod tests {
             &CaptureEvent::Begin {
                 cursor: Some((100, 100)),
                 normalized_cursor: None,
+                source_size: None,
             },
         );
         capture.set_peer_bounds(Position::Right, 2560, 1440);
@@ -1629,6 +1855,7 @@ mod tests {
             &CaptureEvent::Begin {
                 cursor: Some((100, 100)),
                 normalized_cursor: None,
+                source_size: None,
             },
         );
         capture.set_peer_bounds(Position::Right, 2000, 1000);
@@ -1672,6 +1899,7 @@ mod tests {
             &CaptureEvent::Begin {
                 cursor: Some((100, 100)),
                 normalized_cursor: None,
+                source_size: None,
             },
         );
         // The restarted sender begins its generation counter again. Its clock

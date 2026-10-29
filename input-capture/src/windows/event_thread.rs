@@ -4,7 +4,7 @@ use std::ptr::addr_of_mut;
 
 use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -23,12 +23,12 @@ use windows::core::{PCWSTR, w};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
     HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER,
-    WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    RegisterClassW, SetCursorPos, SetTimer, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER, WM_USER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use input_event::{
@@ -38,6 +38,13 @@ use input_event::{
 };
 
 use super::{CaptureEvent, Position, display_util};
+use crate::HostInputState;
+
+static DISPLAY_SNAPSHOT: RwLock<Option<input_event::display::DisplayLayout>> = RwLock::new(None);
+
+pub(crate) fn display_snapshot() -> Option<input_event::display::DisplayLayout> {
+    DISPLAY_SNAPSHOT.read().ok()?.clone()
+}
 
 pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
@@ -56,8 +63,8 @@ impl EventThread {
         }
     }
 
-    pub(crate) fn release_capture(&self) {
-        self.signal(RequestType::Release);
+    pub(crate) fn release_capture(&self, target: Option<(i32, i32)>) {
+        self.client_update(ClientUpdate::Release(target));
     }
 
     pub(crate) fn create(&self, pos: Position) {
@@ -99,11 +106,11 @@ impl Drop for EventThread {
 
 enum RequestType {
     ClientUpdate = 0,
-    Release = 1,
     Exit = 2,
 }
 
 enum ClientUpdate {
+    Release(Option<(i32, i32)>),
     Create(Position),
     Destroy(Position),
     SetCrossingModifier(Position, Option<CrossingModifier>),
@@ -145,6 +152,8 @@ thread_local! {
     /// Momentary modifiers observed by the global low-level keyboard hook,
     /// including presses that happened before an edge activated capture.
     static HOST_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
+    /// Key-downs the host saw before capture must get matching host key-ups.
+    static HOST_VISIBLE_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
     /// Optional per-edge preflight. An absent entry preserves immediate edge
     /// capture without adding any modifier check.
     static CROSSING_MODIFIERS: RefCell<HashMap<Position, CrossingModifier>> = RefCell::new(HashMap::new());
@@ -300,9 +309,6 @@ fn start_routine(
             /* messages sent via PostThreadMessage */
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
-                x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
-                }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
                         let mut res = vec![];
@@ -435,6 +441,9 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
+    HOST_VISIBLE_MODIFIERS.with_borrow_mut(|visible| {
+        HOST_MODIFIERS.with_borrow(|pressed| visible.clone_from(pressed));
+    });
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
@@ -449,11 +458,19 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      * be far worse than a logged drop. */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
+    let (normalized_cursor, source_size) = DISPLAYS.with_borrow(|(displays, _)| {
+        let layout = display_util::display_layout(displays);
+        (
+            crate::normalize_cursor_in_layout(&layout, entry_point),
+            layout.size(),
+        )
+    });
     if let Err(e) = try_send_event(
         active,
         CaptureEvent::Begin {
-            cursor: None,
-            normalized_cursor: None,
+            cursor: Some(entry_point),
+            normalized_cursor,
+            source_size,
         },
     ) {
         log::error!("forwarding channel full — dropped capture-begin event: {e}");
@@ -512,6 +529,14 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         log::warn!("e: {e}");
     }
 
+    if let KeyboardEvent::Key { key, state: 0, .. } = key_event {
+        if let Ok(key) = Linux::try_from(key) {
+            if HOST_VISIBLE_MODIFIERS.with_borrow_mut(|visible| visible.remove(&key)) {
+                return CallNextHookEx(None, ncode, wparam, lparam);
+            }
+        }
+    }
+
     /* don't pass event to applications */
     LRESULT(1)
 }
@@ -534,6 +559,8 @@ unsafe extern "system" fn window_proc(
             WTS_SESSION_LOCK => {
                 HOST_LOCKED.set(true);
                 HOST_MODIFIERS.with_borrow_mut(HashSet::clear);
+                HOST_VISIBLE_MODIFIERS.with_borrow_mut(HashSet::clear);
+                publish_host_input_state(HostInputState::Locked);
                 if let Some(pos) = ACTIVE_CLIENT.take() {
                     log::info!("host session locked mid-capture; releasing");
                     let _ = try_send_event(pos, CaptureEvent::AutoRelease);
@@ -544,11 +571,22 @@ unsafe extern "system" fn window_proc(
             WTS_SESSION_UNLOCK => {
                 HOST_LOCKED.set(false);
                 log::info!("host session unlocked");
+                publish_host_input_state(HostInputState::Unlocked);
             }
             _ => {}
         }
     }
     LRESULT(1)
+}
+
+fn publish_host_input_state(state: HostInputState) {
+    CLIENTS.with_borrow(|clients| {
+        for &pos in clients {
+            if let Err(error) = try_send_event(pos, CaptureEvent::HostInputState(state)) {
+                log::warn!("failed to publish host input {state:?} at {pos}: {error}");
+            }
+        }
+    });
 }
 
 fn update_host_modifier_state(event: &KeyboardEvent) {
@@ -700,10 +738,23 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
             });
         }
     }
+    if let Ok(mut snapshot) = DISPLAY_SNAPSHOT.write() {
+        *snapshot = Some(display_util::display_layout(display_rects));
+    }
 }
 
 fn update_clients(request: ClientUpdate) {
     match request {
+        ClientUpdate::Release(target) => {
+            ACTIVE_CLIENT.take();
+            HOST_VISIBLE_MODIFIERS.with_borrow_mut(HashSet::clear);
+            if let Some((x, y)) = target {
+                PREV_POS.replace(Some((x, y)));
+                if let Err(error) = unsafe { SetCursorPos(x, y) } {
+                    log::warn!("return cursor warp failed: {error}");
+                }
+            }
+        }
         ClientUpdate::Create(pos) => {
             CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
         }
@@ -711,6 +762,7 @@ fn update_clients(request: ClientUpdate) {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
                 if pos == active_pos {
                     let _ = ACTIVE_CLIENT.take();
+                    HOST_VISIBLE_MODIFIERS.with_borrow_mut(HashSet::clear);
                 }
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));

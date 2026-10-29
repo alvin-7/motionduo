@@ -97,7 +97,7 @@ async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 async fn wait_for_service() -> Result<TcpStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect("127.0.0.1:5252").await {
+        if let Ok(stream) = TcpStream::connect(crate::tcp_endpoint()?).await {
             break Ok(stream);
         }
         tokio::time::sleep(exponential_back_off(&mut duration)).await;

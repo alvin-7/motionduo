@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/webrtc-util", "vendor/core-graphics"]
 members = [
     "input-capture",
     "input-emulation",
@@ -7,24 +8,26 @@ members = [
     "mousehop",
     "mousehop-ipc",
     "mousehop-cli",
-    "mousehop-gtk",
     "mousehop-proto",
 ]
 
 [workspace.package]
-version = "0.17.1"
+version = "1.1.0"
 
 [workspace.dependencies]
-input-event = { package = "mousehop-input-event", path = "input-event", version = "0.17.1" }
-input-capture = { package = "mousehop-input-capture", path = "input-capture", version = "0.17.1" }
-input-emulation = { package = "mousehop-input-emulation", path = "input-emulation", version = "0.17.1" }
-mousehop-proto = { path = "mousehop-proto", version = "0.17.1" }
-mousehop-ipc = { path = "mousehop-ipc", version = "0.17.1" }
-mousehop-cli = { path = "mousehop-cli", version = "0.17.1" }
-mousehop-gtk = { path = "mousehop-gtk", version = "0.17.1" }
+input-event = { package = "mousehop-input-event", path = "input-event", version = "1.1.0" }
+input-capture = { package = "mousehop-input-capture", path = "input-capture", version = "1.1.0" }
+input-emulation = { package = "mousehop-input-emulation", path = "input-emulation", version = "1.1.0" }
+mousehop-proto = { path = "mousehop-proto", version = "1.1.0" }
+mousehop-ipc = { path = "mousehop-ipc", version = "1.1.0" }
+mousehop-cli = { path = "mousehop-cli", version = "1.1.0" }
 
 [profile.release]
 codegen-units = 1
 lto = "fat"
 strip = true
 panic = "abort"
+
+[patch.crates-io]
+webrtc-util = { path = "vendor/webrtc-util" }
+core-graphics = { path = "vendor/core-graphics" }

@@ -2,6 +2,17 @@ use windows::Win32::Foundation::RECT;
 
 use crate::Position;
 
+pub(crate) fn display_layout(displays: &[RECT]) -> input_event::display::DisplayLayout {
+    input_event::display::DisplayLayout::new(displays.iter().filter_map(|r| {
+        Some((
+            r.left,
+            r.top,
+            u32::try_from(i64::from(r.right) - i64::from(r.left)).ok()?,
+            u32::try_from(i64::from(r.bottom) - i64::from(r.top)).ok()?,
+        ))
+    }))
+}
+
 fn is_within_dp_region(point: (i32, i32), display: &RECT) -> bool {
     [
         Position::Left,
